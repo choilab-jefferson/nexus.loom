@@ -1,0 +1,91 @@
+stages:
+  - lint
+  - test
+  - build
+  - release
+
+variables:
+  CGO_ENABLED: "0"
+  # Package holding the version/commit vars. `main` is independent of the
+  # module path, so a module rename does not touch this.
+  VERSION_PKG: "main"
+
+go-vet:
+  stage: lint
+  image: golang:1.22-alpine
+  script:
+    - test -z "$(gofmt -l .)"
+    - go vet ./...
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+go-test-and-build:
+  stage: test
+  image: golang:1.22-alpine
+  script:
+    - go test -v ./...
+    - go build -o bin/loom ./cmd/loom
+    - ./bin/loom capabilities --json
+    - ./bin/loom -p "CI smoke test" --provider mock --json
+  artifacts:
+    paths:
+      - bin/loom
+    expire_in: 7 days
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+release-build:
+  stage: build
+  image: golang:1.22-alpine
+  script:
+    - mkdir -p dist
+    - |
+      for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+        os=${t%/*}; arch=${t#*/}
+        GOOS=$os GOARCH=$arch go build -trimpath \
+          -ldflags "-s -w -X ${VERSION_PKG}.version=${CI_COMMIT_TAG} -X ${VERSION_PKG}.commit=${CI_COMMIT_SHORT_SHA}" \
+          -o dist/loom-$os-$arch ./cmd/loom
+      done
+    - cd dist && sha256sum loom-* > checksums.txt && cat checksums.txt
+    - cd .. && echo "BUILD_JOB_ID=${CI_JOB_ID}" > build.env
+  artifacts:
+    paths:
+      - dist/
+    reports:
+      dotenv: build.env
+    expire_in: never
+  rules:
+    - if: $CI_COMMIT_TAG
+
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs:
+    - job: release-build
+      artifacts: true
+  script:
+    - echo "Releasing $CI_COMMIT_TAG"
+  release:
+    tag_name: $CI_COMMIT_TAG
+    description: "loom $CI_COMMIT_TAG"
+    assets:
+      links:
+        - name: loom-linux-amd64
+          url: "${CI_PROJECT_URL}/-/jobs/${BUILD_JOB_ID}/artifacts/raw/dist/loom-linux-amd64"
+          direct_asset_path: /loom-linux-amd64
+        - name: loom-linux-arm64
+          url: "${CI_PROJECT_URL}/-/jobs/${BUILD_JOB_ID}/artifacts/raw/dist/loom-linux-arm64"
+          direct_asset_path: /loom-linux-arm64
+        - name: loom-darwin-amd64
+          url: "${CI_PROJECT_URL}/-/jobs/${BUILD_JOB_ID}/artifacts/raw/dist/loom-darwin-amd64"
+          direct_asset_path: /loom-darwin-amd64
+        - name: loom-darwin-arm64
+          url: "${CI_PROJECT_URL}/-/jobs/${BUILD_JOB_ID}/artifacts/raw/dist/loom-darwin-arm64"
+          direct_asset_path: /loom-darwin-arm64
+        - name: checksums.txt
+          url: "${CI_PROJECT_URL}/-/jobs/${BUILD_JOB_ID}/artifacts/raw/dist/checksums.txt"
+          direct_asset_path: /checksums.txt
+  rules:
+    - if: $CI_COMMIT_TAG

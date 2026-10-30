@@ -1,0 +1,5 @@
+bin/
+/loom
+*.jsonl
+.worktrees/
+.wiki-state.json
