@@ -1,6 +1,6 @@
 # Loom on Google Colab
 
-Loom is a single static binary with no dependencies, no daemon and no TTY prompts, so it runs from a plain `!` cell. It reads no files under `~/.config/nexus` and writes nothing outside the workspace and the optional `--trace` path. Run each block as its own cell. Prefer the terminal? See [colab-cli.md](colab-cli.md).
+Loom is a single static binary with no dependencies, no daemon and no TTY prompts, so it runs from a plain `!` cell. In Colab it reads nothing from `~/.config/nexus` because that directory does not exist there (loom reads `tokens.env` and `google-agent-platform-credit.json` from it only when present). It writes nothing outside the workspace and the optional `--trace` path. Run each block as its own cell. Prefer the terminal? See [colab-cli.md](colab-cli.md).
 
 Release assets live under `https://github.com/choilab-jefferson/nexus.loom/releases/download/<tag>/`; replace `v0.1.0` below with the release you want.
 

@@ -80,7 +80,7 @@ All tool schemas are deterministically sorted by name in `CanonicalToolSchemasJS
 
 ### 5.1 Token Store Resolution (`~/.config/nexus/tokens.env`)
 
-`ReadNexusTokenStore()` reads `$NEXUS_CONFIG_HOME/tokens.env` (default `~/.config/nexus/tokens.env`). `ResolveAPIKey(keys...)` checks the token store first and falls back to `os.Getenv`. All HTTP errors are passed through `RedactSecret(msg, secret)` to scrub raw keys and `AIza...` / `sk-...` tokens.
+`ReadNexusTokenStore()` reads `$NEXUS_CONFIG_HOME/tokens.env` (default `~/.config/nexus/tokens.env`). `ResolveAPIKey(keys...)` checks `os.Getenv` first (standard name, then the `NEXUS_*` alias) and falls back to the token store. All HTTP errors are passed through `RedactSecret(msg, secret)` to scrub raw keys and `AIza...` / `sk-...` tokens.
 
 ### 5.2 Provider Implementations
 
@@ -104,6 +104,8 @@ All tool schemas are deterministically sorted by name in `CanonicalToolSchemasJS
 ---
 
 ## 7. CLI Contract & Exit Codes (`cmd/loom`)
+
+> The machine-readable contract (versioned JSON schemas, trace events, exit codes) is in [../contract.md](../contract.md).
 
 ```bash
 # Task-file execution mode

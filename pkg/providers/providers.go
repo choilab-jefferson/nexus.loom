@@ -757,7 +757,7 @@ func (p *GoogleAgentPlatformProvider) EndpointURL() (string, error) {
 		}
 	}
 	if proj == "" {
-		return "", fmt.Errorf("Google Agent Platform project is not configured in ~/.config/nexus/google-agent-platform-credit.json or NEXUS_GCP_PROJECT")
+		return "", fmt.Errorf("Google Agent Platform project is not configured: set NEXUS_GCP_PROJECT (and optionally NEXUS_GCP_LOCATION), or provide a JSON file {project, location} via NEXUS_GAP_CREDIT_CONFIG or $NEXUS_CONFIG_HOME/google-agent-platform-credit.json")
 	}
 	cleanModel := strings.TrimPrefix(p.Model, "models/")
 	if p.BaseURL != "" {

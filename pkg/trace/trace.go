@@ -10,6 +10,10 @@ import (
 	"sync"
 )
 
+// SchemaVersion is the trace JSONL contract version (docs/contract.md); it is
+// stamped on every emitted event as "schema_version".
+const SchemaVersion = 1
+
 // Writer writes structured JSONL events per Loom v5.1 §5.4.
 type Writer struct {
 	mu   sync.Mutex
@@ -51,7 +55,12 @@ func (w *Writer) Emit(event map[string]any) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	raw, err := json.Marshal(event)
+	stamped := make(map[string]any, len(event)+1)
+	for k, v := range event {
+		stamped[k] = v
+	}
+	stamped["schema_version"] = SchemaVersion
+	raw, err := json.Marshal(stamped)
 	if err != nil {
 		return err
 	}

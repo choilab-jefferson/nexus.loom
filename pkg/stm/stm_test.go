@@ -187,3 +187,55 @@ func TestDiscoverAgentsMDConfinedToGitRoot(t *testing.T) {
 		t.Fatalf("want in-root AGENTS.md, got %q", c)
 	}
 }
+
+func TestResolveProjectIDStmWFallback(t *testing.T) {
+	stmRoot := t.TempDir()
+	t.Setenv("NEXUS_STM_DIR", stmRoot)
+	pid := "p601d8f44903f4fe1f167"
+	other := "p111111111111111111aa"
+	nodeDir := filepath.Join(stmRoot, "stm-w0123456789abcdef0123", "node")
+	if err := os.MkdirAll(nodeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := "- id: " + other + "\n  line: otherproj: unrelated\n- id: \"" + pid + "\"\n  line: \"myslug: workspace entity\"\n"
+	if err := os.WriteFile(filepath.Join(nodeDir, "w0123456789abcdef0123.md"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ws := filepath.Join(t.TempDir(), "myslug")
+	if err := os.MkdirAll(ws, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := ResolveProjectID(ws); got != pid {
+		t.Fatalf("stm-w* fallback: expected %s, got %q", pid, got)
+	}
+	nomatch := filepath.Join(t.TempDir(), "nomatch")
+	if err := os.MkdirAll(nomatch, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := ResolveProjectID(nomatch); got != "" {
+		t.Fatalf("expected empty id for unmatched slug, got %q", got)
+	}
+}
+
+func TestEmptySTMDirDisablesLookup(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("NEXUS_STM_DIR", "")
+	// A decoy under the default host location must never be read.
+	nodeDir := filepath.Join(home, ".local", "share", "nexus", "stm", "stm-w0123456789abcdef0123", "node")
+	if err := os.MkdirAll(nodeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	decoy := "- id: p601d8f44903f4fe1f167\n  line: myslug: x\n"
+	if err := os.WriteFile(filepath.Join(nodeDir, "w0123456789abcdef0123.md"), []byte(decoy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ws := filepath.Join(t.TempDir(), "myslug")
+	if err := os.MkdirAll(ws, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := ResolveProjectID(ws); got != "" {
+		t.Fatalf("empty NEXUS_STM_DIR must not read host stm dir, got %q", got)
+	}
+}

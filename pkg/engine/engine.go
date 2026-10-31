@@ -101,6 +101,7 @@ type TaskSlice struct {
 
 // EscalationPayload is the structured Exit Code 3 handover object (§5.5).
 type EscalationPayload struct {
+	SchemaVersion int       `json:"schema_version"`
 	T             string    `json:"t"`
 	Reason        string    `json:"reason"`
 	Attempts      int       `json:"attempts"`
@@ -111,17 +112,22 @@ type EscalationPayload struct {
 	TaskSlice     TaskSlice `json:"task_slice"`
 }
 
+// SchemaVersion is the version of the TaskResult / EscalationPayload JSON contract
+// (docs/contract.md). Additive field changes keep it; breaking changes bump it.
+const SchemaVersion = 1
+
 // TaskResult captures the terminal outcome of RunTask.
 type TaskResult struct {
-	ExitCode    int                `json:"exit_code"`
-	Status      string             `json:"status"`
-	Output      string             `json:"output"`
-	Turns       int                `json:"turns"`
-	PrefixHash  string             `json:"prefix_hash"`
-	Compactions int                `json:"compactions"`
-	Escalation  *EscalationPayload `json:"escalation,omitempty"`
-	RunID       string             `json:"run_id,omitempty"`
-	Usage       Usage              `json:"usage"`
+	SchemaVersion int                `json:"schema_version"`
+	ExitCode      int                `json:"exit_code"`
+	Status        string             `json:"status"`
+	Output        string             `json:"output"`
+	Turns         int                `json:"turns"`
+	PrefixHash    string             `json:"prefix_hash"`
+	Compactions   int                `json:"compactions"`
+	Escalation    *EscalationPayload `json:"escalation,omitempty"`
+	RunID         string             `json:"run_id,omitempty"`
+	Usage         Usage              `json:"usage"`
 }
 
 // Usage is cumulative provider-reported token usage for a run.
@@ -191,6 +197,10 @@ func RunTaskWithOptions(ctx context.Context, spec TaskSpec, pol *policy.PolicyCo
 		st.usage = opts.Resume.Usage
 	}
 	res := runTask(ctx, spec, pol, prov, traceWriter, st)
+	res.SchemaVersion = SchemaVersion
+	if res.Escalation != nil {
+		res.Escalation.SchemaVersion = SchemaVersion
+	}
 	res.RunID = st.runID
 	res.Usage = st.usage
 	done := map[string]any{

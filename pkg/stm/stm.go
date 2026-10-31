@@ -156,6 +156,9 @@ func ResolveProjectID(workspace string) string {
 	// Fallback: scan $NEXUS_STM_DIR/stm-w*/node/w*.md for matching project slug
 	slug := filepath.Base(abs)
 	stmRoot := resolveSTMRoot()
+	if stmRoot == "" {
+		return ""
+	}
 	matches, _ := filepath.Glob(filepath.Join(stmRoot, "stm-w*", "node", "w*.md"))
 	for _, m := range matches {
 		data, err := os.ReadFile(m)
@@ -212,8 +215,9 @@ func matchProjectIDFromWorkspaceNode(content, slug string) string {
 }
 
 func resolveSTMRoot() string {
-	if env := strings.TrimSpace(os.Getenv("NEXUS_STM_DIR")); env != "" {
-		return env
+	if env, set := os.LookupEnv("NEXUS_STM_DIR"); set {
+		// Set-but-empty disables STM lookup instead of falling back to the host default.
+		return strings.TrimSpace(env)
 	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {

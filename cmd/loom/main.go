@@ -148,12 +148,24 @@ func runCapabilities(args []string) int {
 	}
 	_ = jsonOut
 
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(capabilitiesMap()); err != nil {
+		return policy.ExitHarnessErr
+	}
+	return policy.ExitOK
+}
+
+// capabilitiesMap is the `loom capabilities --json` document (docs/contract.md).
+func capabilitiesMap() map[string]any {
 	var toolNames []string
 	for _, s := range tools.BuiltinSchemas() {
 		toolNames = append(toolNames, s.Name)
 	}
-	caps := map[string]any{
+	return map[string]any{
 		"schema_version":     1,
+		"version":            version,
+		"commit":             commit,
 		"harness":            "loom",
 		"spec_version":       "0.1",
 		"invariants":         []string{"I1", "I2", "I3", "I4"},
@@ -163,12 +175,6 @@ func runCapabilities(args []string) int {
 		"agents_md_autoload": true,
 		"exit_codes":         exitCodeNames,
 	}
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(caps); err != nil {
-		return policy.ExitHarnessErr
-	}
-	return policy.ExitOK
 }
 
 func runSTM(args []string) int {

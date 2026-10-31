@@ -3,6 +3,8 @@ package engine
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/choilab-jefferson/nexus.loom/pkg/compact"
@@ -79,6 +81,33 @@ func TestMaxOutputTokensConfigurable(t *testing.T) {
 			policy.DefaultPolicyConfig(t.TempDir()), capProvider{&got}, trace.NewWriter(&buf))
 		if got != c.want {
 			t.Errorf("spec=%d env=%q: got %d want %d", c.spec, c.env, got, c.want)
+		}
+	}
+}
+
+// TestSchemaVersionOnResultAndTrace pins the docs/contract.md schema_version keys.
+func TestSchemaVersionOnResultAndTrace(t *testing.T) {
+	ws := t.TempDir()
+	var buf bytes.Buffer
+	prov := providers.NewScriptedMockProvider(providers.Response{RawStopReason: "stop", ToolCalls: []compact.ToolCall{
+		{ID: "e", Name: "escalate", Arguments: map[string]any{"reason": "r", "minimal_context": "c"}}}})
+	res := RunTask(context.Background(), TaskSpec{Instruction: "x"}, policy.DefaultPolicyConfig(ws), prov, trace.NewWriter(&buf))
+	if res.SchemaVersion != 1 || res.Escalation == nil || res.Escalation.SchemaVersion != 1 {
+		t.Fatalf("schema_version missing: %+v", res)
+	}
+	raw, _ := json.Marshal(res)
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil || m["schema_version"] != float64(1) {
+		t.Fatalf("TaskResult JSON schema_version = %v (%v)", m["schema_version"], err)
+	}
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("expected trace events, got %q", buf.String())
+	}
+	for _, l := range lines {
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(l), &ev); err != nil || ev["schema_version"] != float64(1) {
+			t.Fatalf("trace event lacks schema_version: %s", l)
 		}
 	}
 }
