@@ -179,6 +179,36 @@ func TestOllamaReachable(t *testing.T) {
 	}
 }
 
+func TestAutoPHISkipsCloudProviders(t *testing.T) {
+	hermetic(t)
+	t.Setenv("OPENAI_BASE_URL", "")
+	t.Setenv("OLLAMA_HOST", "")
+	t.Setenv("ANTHROPIC_API_KEY", "a")
+	t.Setenv("GEMINI_API_KEY", "g")
+	t.Setenv("OPENAI_API_KEY", "o")
+	if got, err := ResolveProviderNamePHI("auto", up, true); err != nil || got != "ollama" {
+		t.Fatalf("phi+keys+ollama: got %q, %v", got, err)
+	}
+	if _, err := ResolveProviderNamePHI("auto", down, true); err == nil {
+		t.Fatal("phi with cloud keys and no ollama must error")
+	}
+	t.Setenv("OPENAI_BASE_URL", "http://127.0.0.1:8000")
+	if got, _ := ResolveProviderNamePHI("auto", down, true); got != "openai" {
+		t.Fatalf("phi with local openai endpoint: got %q", got)
+	}
+}
+
+func TestAutoNonPHIUnchanged(t *testing.T) {
+	hermetic(t)
+	t.Setenv("ANTHROPIC_API_KEY", "a")
+	if got, _ := ResolveProviderNamePHI("auto", up, false); got != "anthropic" {
+		t.Fatalf("non-phi: got %q", got)
+	}
+	if got, _ := ResolveProviderName("auto", up); got != "anthropic" {
+		t.Fatalf("wrapper: got %q", got)
+	}
+}
+
 func TestKeyPrecedenceStandardThenNexusThenFile(t *testing.T) {
 	dir := hermetic(t)
 	writeTokens(t, dir, "ANTHROPIC_API_KEY=file-std\nNEXUS_ANTHROPIC_API_KEY=file-nx\nOPENAI_API_KEY=file-oa\n")

@@ -125,6 +125,17 @@ func (b budgetFlags) apply(spec *engine.TaskSpec) {
 	}
 }
 
+// exitCodeNames is the machine-readable exit-code contract emitted by
+// `loom capabilities --json`; TestCapabilitiesExitCodesParity pins it to policy.Exit*.
+var exitCodeNames = map[string]int{
+	"ok":                      policy.ExitOK,
+	"task_failure":            policy.ExitTaskFail,
+	"harness_or_policy_error": policy.ExitHarnessErr,
+	"escalation_required":     policy.ExitEscalate,
+	"budget_exhausted":        policy.ExitBudget,
+	"interrupted":             policy.ExitInterrupted,
+}
+
 func runCapabilities(args []string) int {
 	fs := flag.NewFlagSet("capabilities", flag.ContinueOnError)
 	jsonOut := fs.Bool("json", true, "emit capabilities as JSON")
@@ -150,14 +161,7 @@ func runCapabilities(args []string) int {
 		"providers":          []string{"ollama", "openai", "anthropic", "anthropic-api", "gemini", "gemini-api", "google-agent-platform", "typesafe", "mock"},
 		"stm_integration":    true,
 		"agents_md_autoload": true,
-		"exit_codes": map[string]int{
-			"ok":                      policy.ExitOK,
-			"task_failure":            policy.ExitTaskFail,
-			"harness_or_policy_error": policy.ExitHarnessErr,
-			"escalation_required":     policy.ExitEscalate,
-			"budget_exhausted":        policy.ExitBudget,
-			"interrupted":             policy.ExitInterrupted,
-		},
+		"exit_codes":         exitCodeNames,
 	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
@@ -467,7 +471,7 @@ func runResume(args []string) int {
 }
 
 func buildProvider(name, model string, phiMode bool) (providers.Provider, error) {
-	name, err := providers.ResolveProviderName(name, providers.OllamaReachable)
+	name, err := providers.ResolveProviderNamePHI(name, providers.OllamaReachable, phiMode)
 	if err != nil {
 		return nil, err
 	}

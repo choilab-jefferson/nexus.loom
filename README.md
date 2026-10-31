@@ -65,7 +65,7 @@ Keys: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`/`GOOGLE_API_KEY`, 
 | `4` | `policy.ExitBudget` | Token, deadline or tool-call budget exhausted |
 | `130` | `policy.ExitInterrupted` | SIGINT/SIGTERM; resumable via `loom resume <trace>` |
 
-Details: [`docs/spec/loom-v0.1.md`](docs/spec/loom-v0.1.md). Colab: [`docs/colab-quickstart.md`](docs/colab-quickstart.md).
+`loom capabilities --json` is the machine-readable contract (tools, providers, exit codes). Details: [`docs/spec/loom-v0.1.md`](docs/spec/loom-v0.1.md). Colab: [`docs/colab-quickstart.md`](docs/colab-quickstart.md).
 
 ## Nexus integration (optional)
 

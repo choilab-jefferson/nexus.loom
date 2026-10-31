@@ -1299,9 +1299,28 @@ var AutoProviderKeys = []struct {
 	{"openai", []string{"OPENAI_API_KEY", "NEXUS_OPENAI_API_KEY", "LOOM_API_KEY"}},
 }
 
+// PHIPermitted reports whether a provider may run under PHI mode, reusing the
+// same endpoint check (IsLocalEndpoint) the providers enforce in Chat. Cloud-only
+// providers (anthropic, gemini, ...) are never permitted.
+func PHIPermitted(provider string) bool {
+	switch provider {
+	case "ollama":
+		return IsLocalEndpoint(NewOllamaProvider("", "", true).BaseURL)
+	case "openai":
+		return IsLocalEndpoint(NewOpenAIProvider("", "", "", true).BaseURL)
+	}
+	return false
+}
+
 // ResolveProviderName maps "", "auto" or LOOM_PROVIDER to a concrete provider.
 // An explicit non-auto name is returned unchanged. ollamaUp is injectable.
 func ResolveProviderName(name string, ollamaUp func() bool) (string, error) {
+	return ResolveProviderNamePHI(name, ollamaUp, false)
+}
+
+// ResolveProviderNamePHI is ResolveProviderName; when phi is true, auto
+// selection skips providers that PHIPermitted rejects.
+func ResolveProviderNamePHI(name string, ollamaUp func() bool, phi bool) (string, error) {
 	name = strings.ToLower(strings.TrimSpace(name))
 	if name == "" || name == "auto" {
 		name = strings.ToLower(strings.TrimSpace(os.Getenv("LOOM_PROVIDER")))
@@ -1310,11 +1329,11 @@ func ResolveProviderName(name string, ollamaUp func() bool) (string, error) {
 		return name, nil
 	}
 	for _, e := range AutoProviderKeys {
-		if ResolveAPIKey(e.Keys...) != "" {
+		if ResolveAPIKey(e.Keys...) != "" && (!phi || PHIPermitted(e.Provider)) {
 			return e.Provider, nil
 		}
 	}
-	if ollamaUp != nil && ollamaUp() {
+	if ollamaUp != nil && ollamaUp() && (!phi || PHIPermitted("ollama")) {
 		return "ollama", nil
 	}
 	return "", fmt.Errorf("no model provider configured: set one of ANTHROPIC_API_KEY, GEMINI_API_KEY (or GOOGLE_API_KEY), OPENAI_API_KEY in the environment " +
