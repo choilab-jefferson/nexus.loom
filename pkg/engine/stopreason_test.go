@@ -126,3 +126,49 @@ func TestMaxTokensHintAndPrecedence(t *testing.T) {
 		t.Fatal("precedence spec > env broken")
 	}
 }
+
+func TestStopEventPerTurnUsageSumsToFinal(t *testing.T) {
+	ws := t.TempDir()
+	pol := policy.DefaultPolicyConfig(ws)
+	mock := providers.NewScriptedMockProvider(
+		providers.Response{
+			RawStopReason: "tool_calls", PromptTokens: 100, OutputTokens: 10, CacheReadTokens: 40,
+			ToolCalls: []compact.ToolCall{{ID: "c1", Name: "write_file", Arguments: map[string]any{"path": "a.txt", "content": "x"}}},
+		},
+		providers.Response{Content: "ok", RawStopReason: "stop", PromptTokens: 150, OutputTokens: 5, CacheCreationTokens: 7},
+	)
+	var buf bytes.Buffer
+	res := RunTask(context.Background(), TaskSpec{TaskID: "u1", Agent: "coder", Instruction: "x", Constraints: TaskConstraints{MaxTurns: 4}}, pol, mock, trace.NewWriter(&buf))
+	if res.ExitCode != policy.ExitOK {
+		t.Fatalf("exit %d: %s", res.ExitCode, res.Output)
+	}
+	var sum, n int
+	wantReason := []string{"tool_use", "end_turn"}
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatal(err)
+		}
+		if ev["t"] != "stop" {
+			continue
+		}
+		n++
+		if int(ev["turn"].(float64)) != n || ev["reason"] != wantReason[n-1] {
+			t.Fatalf("turn %d event wrong: %v", n, ev)
+		}
+		sum += int(ev["total_tokens"].(float64))
+		cum := ev["cumulative"].(map[string]any)
+		if int(cum["total_tokens"].(float64)) != sum {
+			t.Fatalf("cumulative %v != running sum %d", cum, sum)
+		}
+	}
+	if n != res.Turns {
+		t.Fatalf("stop events %d != turns %d", n, res.Turns)
+	}
+	if sum != res.Usage.TotalTokens || sum != 265 {
+		t.Fatalf("sum %d vs usage %d", sum, res.Usage.TotalTokens)
+	}
+	if res.Usage.CacheReadTokens != 40 || res.Usage.CacheCreationTokens != 7 {
+		t.Fatalf("cache usage %+v", res.Usage)
+	}
+}

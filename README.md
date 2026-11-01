@@ -40,7 +40,7 @@ Run `loom` with no arguments (exit 2) or `loom --help` (exit 0) for the full lis
 |---|---|
 | `-p "<text>"` | one-shot instruction (or `loom run --task-file task.json`) |
 | `--provider` | `auto`, `ollama`, `openai`, `anthropic`, `gemini`, `google-agent-platform`, `typesafe`, `mock` |
-| `--model` | model id (provider default otherwise) |
+| `--model` | model id (provider default otherwise; see "Models" below) |
 | `--workspace` | workspace root; all file access is confined here |
 | `--allow-cmd "git status"` | allow a command prefix for `run_command` (repeatable; none by default). On `loom run` it is unioned with task.json `constraints.allow_commands`, then intersected with global/agent layers |
 | `--pass-env NAME[,NAME\|PREFIX*]` | extra env vars for `run_command` children (repeatable; also `run`/`resume`, spec `constraints.pass_env`). ML defaults (PYTHONPATH, CUDA_*, HF_HOME, ...) pass already; secrets (`*TOKEN*`, `*_API_KEY`, ...) only by exact name, with a warning |
@@ -52,6 +52,12 @@ Run `loom` with no arguments (exit 2) or `loom --help` (exit 0) for the full lis
 
 Keys: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`/`GOOGLE_API_KEY`, `TYPESAFE_API_KEY`.
 
+## Models
+
+Defaults: gemini `gemini-3.8-flash`, anthropic `claude-sonnet-5-5`, openai `gpt-4o-mini`, ollama `qwen3:4b` (`qwen3.5:4b-mlx` on macOS). Override with `--model` or `LOOM_MODEL`.
+List the ids your key can use (network call, only when invoked): `loom models --provider gemini|openai|anthropic|ollama [--json]`.
+An unknown id fails fast on the first call with exit 2 and `loom: model "X" not found or not served by provider P; run "loom models --provider P" ...` (no retry, no allowlist). See docs/contract.md.
+
 ## Safety model
 
 - File tools resolve symlinks and refuse paths outside `--workspace` or matching deny globs.
@@ -59,6 +65,14 @@ Keys: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`/`GOOGLE_API_KEY`, 
 - API keys are scrubbed from child-process environments and redacted in errors.
 - Budgets (turns, tokens, tool calls, deadline) end the run with a defined exit code and trace.
 - Three consecutive tool errors stop the run.
+
+## Parallel runs
+
+Many loom processes can run at once (e.g. one per task) if each has its own `--trace` and its own `--workspace`.
+
+- Distinct `--trace` paths never collide (the checkpoint is `<trace>.ckpt`, written atomically). `--trace ""` means no trace and no resume.
+- A second process on the same `--workspace` or the same `--trace` is refused immediately with exit 2 and a one-line error (advisory `flock`, released by the kernel when a process dies, so there are no stale locks and no lock files). Unix only; elsewhere the check is a no-op.
+- Provider rate limits and API-key quotas are shared across processes, so many parallel runs may hit 429s.
 
 ## Exit codes
 

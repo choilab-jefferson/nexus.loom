@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -43,6 +44,7 @@ Usage:
   loom run --task-file task.json      task from a JSON file
   loom resume <trace.jsonl>           resume an interrupted run
   loom capabilities --json            print tools/providers as JSON
+  loom models --provider P [--json]   list model ids served to your key (network; opt-in)
   loom version
 
 Core flags:
@@ -86,6 +88,8 @@ func runMain(args []string) int {
 		switch args[0] {
 		case "capabilities":
 			return runCapabilities(args[1:])
+		case "models":
+			return runModels(args[1:])
 		case "stm":
 			return runSTM(args[1:])
 		case "run":
@@ -224,6 +228,8 @@ func capabilitiesMap() map[string]any {
 		"invariants":         []string{"I1", "I2", "I3", "I4"},
 		"builtin_tools":      toolNames,
 		"providers":          []string{"ollama", "openai", "anthropic", "anthropic-api", "gemini", "gemini-api", "google-agent-platform", "typesafe", "mock"},
+		"subcommands":        []string{"run", "resume", "capabilities", "models", "stm", "version"},
+		"default_models":     defaultModels(),
 		"stm_integration":    true,
 		"agents_md_autoload": true,
 		"exit_codes":         exitCodeNames,
@@ -433,6 +439,12 @@ func writeCkpt(meta runMeta, cp engine.Checkpoint) {
 }
 
 func runAndReport(spec engine.TaskSpec, pol *policy.PolicyConfig, prov providers.Provider, meta runMeta, resume *engine.Checkpoint, jsonOut bool) int {
+	release, lerr := acquireRunLocks(meta.Workspace, meta.Trace)
+	if lerr != nil {
+		fmt.Fprintln(os.Stderr, lerr)
+		return policy.ExitHarnessErr
+	}
+	defer release()
 	tw, err := trace.NewFileWriter(meta.Trace)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "loom trace error: %v\n", err)
@@ -444,7 +456,7 @@ func runAndReport(spec engine.TaskSpec, pol *policy.PolicyConfig, prov providers
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	opts := engine.RunOptions{Resume: resume}
+	opts := engine.RunOptions{Resume: resume, TracePath: meta.Trace}
 	if meta.Trace != "" {
 		opts.OnCheckpoint = func(cp engine.Checkpoint) { writeCkpt(meta, cp) }
 	}
@@ -561,4 +573,53 @@ func needKey(p providers.Provider, key string, phiMode bool, envNames string) (p
 		return nil, fmt.Errorf("missing API key: set %s in the environment (optionally the Nexus token file ~/.config/nexus/tokens.env), or choose another --provider (e.g. ollama, mock)", envNames)
 	}
 	return p, nil
+}
+
+// defaultModels is the per-provider default model id (docs/contract.md); LOOM_MODEL overrides at run time.
+func defaultModels() map[string]string {
+	return map[string]string{
+		"ollama":                providers.DefaultOllamaModel(runtime.GOOS),
+		"openai":                "gpt-4o-mini",
+		"anthropic":             "claude-sonnet-5-5",
+		"gemini":                "gemini-3.8-flash",
+		"google-agent-platform": "gemini-3.8-flash",
+		"typesafe":              "jev-latest",
+	}
+}
+
+// runModels implements `loom models --provider P [--json]`: the only path that lists models over the network.
+func runModels(args []string) int {
+	fs := flag.NewFlagSet("models", flag.ContinueOnError)
+	provider := fs.String("provider", "", "provider: ollama|openai|anthropic|gemini")
+	jsonOut := fs.Bool("json", false, "emit {provider, models} as JSON")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return policy.ExitOK
+		}
+		fmt.Fprintf(os.Stderr, "loom models flag error: %v\n", err)
+		return policy.ExitHarnessErr
+	}
+	if *provider == "" {
+		fmt.Fprintln(os.Stderr, "loom models error: --provider is required (ollama|openai|anthropic|gemini)")
+		return policy.ExitHarnessErr
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	ids, err := providers.ListModels(ctx, *provider)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "loom models error: %v\n", err)
+		return policy.ExitHarnessErr
+	}
+	if *jsonOut {
+		if ids == nil {
+			ids = []string{}
+		}
+		raw, _ := json.MarshalIndent(map[string]any{"schema_version": 1, "provider": *provider, "models": ids}, "", "  ")
+		fmt.Println(string(raw))
+		return policy.ExitOK
+	}
+	for _, id := range ids {
+		fmt.Println(id)
+	}
+	return policy.ExitOK
 }

@@ -93,8 +93,13 @@ type Response struct {
 	PromptTokens    int                `json:"prompt_tokens"`
 	PromptEvalCount int                `json:"prompt_eval_count"`
 	OutputTokens    int                `json:"output_tokens"`
-	Model           string             `json:"model"`
-	Provider        string             `json:"provider"`
+	// Cache tokens (0 when the provider does not report them). Anthropic reports
+	// them separately from PromptTokens; OpenAI/Gemini cached tokens are a subset
+	// of PromptTokens.
+	CacheCreationTokens int    `json:"cache_creation_tokens,omitempty"`
+	CacheReadTokens     int    `json:"cache_read_tokens,omitempty"`
+	Model               string `json:"model"`
+	Provider            string `json:"provider"`
 }
 
 // Provider is the single-turn model inference interface for Loom v0.1.
@@ -244,7 +249,7 @@ func (p *OllamaProvider) Chat(ctx context.Context, prefix compact.PrefixHeader, 
 		if strings.Contains(err.Error(), "connection refused") {
 			return Response{}, fmt.Errorf("ollama not reachable at %s (start it with `ollama serve`, set OLLAMA_HOST, or pick another --provider such as anthropic or mock): %w", p.BaseURL, err)
 		}
-		return Response{}, err
+		return Response{}, tagModelErr(err, "ollama", p.Model)
 	}
 
 	var parsed struct {
@@ -400,7 +405,7 @@ func (p *OpenAIProvider) Chat(ctx context.Context, prefix compact.PrefixHeader, 
 
 	body, err := doJSONPost(ctx, p.Client, p.BaseURL+"/v1/chat/completions", headers, payload, p.APIKey)
 	if err != nil {
-		return Response{}, err
+		return Response{}, tagModelErr(err, "openai", p.Model)
 	}
 
 	var parsed struct {
@@ -418,8 +423,11 @@ func (p *OpenAIProvider) Chat(ctx context.Context, prefix compact.PrefixHeader, 
 			} `json:"message"`
 		} `json:"choices"`
 		Usage struct {
-			PromptTokens int `json:"prompt_tokens"`
-			OutTokens    int `json:"completion_tokens"`
+			PromptTokens        int `json:"prompt_tokens"`
+			OutTokens           int `json:"completion_tokens"`
+			PromptTokensDetails struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
@@ -444,14 +452,15 @@ func (p *OpenAIProvider) Chat(ctx context.Context, prefix compact.PrefixHeader, 
 		})
 	}
 	return Response{
-		Content:       choice.Message.Content,
-		ToolCalls:     tcs,
-		StopReason:    NormalizeStopReason(choice.FinishReason, tcs),
-		RawStopReason: choice.FinishReason,
-		PromptTokens:  parsed.Usage.PromptTokens,
-		OutputTokens:  parsed.Usage.OutTokens,
-		Model:         p.Model,
-		Provider:      "openai",
+		Content:         choice.Message.Content,
+		ToolCalls:       tcs,
+		StopReason:      NormalizeStopReason(choice.FinishReason, tcs),
+		RawStopReason:   choice.FinishReason,
+		PromptTokens:    parsed.Usage.PromptTokens,
+		OutputTokens:    parsed.Usage.OutTokens,
+		CacheReadTokens: parsed.Usage.PromptTokensDetails.CachedTokens,
+		Model:           p.Model,
+		Provider:        "openai",
 	}, nil
 }
 
@@ -585,7 +594,7 @@ func (p *AnthropicProvider) Chat(ctx context.Context, prefix compact.PrefixHeade
 
 	body, err := doJSONPost(ctx, p.Client, p.BaseURL+"/v1/messages", headers, payload, p.APIKey)
 	if err != nil {
-		return Response{}, err
+		return Response{}, tagModelErr(err, "anthropic", p.Model)
 	}
 
 	var parsed struct {
@@ -598,8 +607,10 @@ func (p *AnthropicProvider) Chat(ctx context.Context, prefix compact.PrefixHeade
 			Input map[string]any `json:"input"`
 		} `json:"content"`
 		Usage struct {
-			InputTokens int `json:"input_tokens"`
-			OutTokens   int `json:"output_tokens"`
+			InputTokens         int `json:"input_tokens"`
+			OutTokens           int `json:"output_tokens"`
+			CacheCreationTokens int `json:"cache_creation_input_tokens"`
+			CacheReadTokens     int `json:"cache_read_input_tokens"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
@@ -621,14 +632,16 @@ func (p *AnthropicProvider) Chat(ctx context.Context, prefix compact.PrefixHeade
 		}
 	}
 	return Response{
-		Content:       strings.Join(textParts, "\n"),
-		ToolCalls:     tcs,
-		StopReason:    NormalizeStopReason(parsed.StopReason, tcs),
-		RawStopReason: parsed.StopReason,
-		PromptTokens:  parsed.Usage.InputTokens,
-		OutputTokens:  parsed.Usage.OutTokens,
-		Model:         p.Model,
-		Provider:      "anthropic",
+		Content:             strings.Join(textParts, "\n"),
+		ToolCalls:           tcs,
+		StopReason:          NormalizeStopReason(parsed.StopReason, tcs),
+		RawStopReason:       parsed.StopReason,
+		PromptTokens:        parsed.Usage.InputTokens,
+		OutputTokens:        parsed.Usage.OutTokens,
+		CacheCreationTokens: parsed.Usage.CacheCreationTokens,
+		CacheReadTokens:     parsed.Usage.CacheReadTokens,
+		Model:               p.Model,
+		Provider:            "anthropic",
 	}, nil
 }
 
@@ -915,7 +928,7 @@ func doGeminiGenerateContent(
 	}
 	body, err := doJSONPost(ctx, client, endpoint, headers, payload, apiKey)
 	if err != nil {
-		return Response{}, err
+		return Response{}, tagModelErr(err, providerName, model)
 	}
 
 	var parsed struct {
@@ -936,6 +949,7 @@ func doGeminiGenerateContent(
 		UsageMetadata struct {
 			PromptTokenCount int `json:"promptTokenCount"`
 			CandTokens       int `json:"candidatesTokenCount"`
+			CachedTokens     int `json:"cachedContentTokenCount"`
 		} `json:"usageMetadata"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
@@ -969,14 +983,15 @@ func doGeminiGenerateContent(
 		promptToks = compact.EstimateTotalTokens(prefix, msgs)
 	}
 	return Response{
-		Content:       strings.Join(texts, "\n"),
-		ToolCalls:     tcs,
-		StopReason:    NormalizeStopReason(cand.FinishReason, tcs),
-		RawStopReason: cand.FinishReason,
-		PromptTokens:  promptToks,
-		OutputTokens:  parsed.UsageMetadata.CandTokens,
-		Model:         model,
-		Provider:      providerName,
+		Content:         strings.Join(texts, "\n"),
+		ToolCalls:       tcs,
+		StopReason:      NormalizeStopReason(cand.FinishReason, tcs),
+		RawStopReason:   cand.FinishReason,
+		PromptTokens:    promptToks,
+		OutputTokens:    parsed.UsageMetadata.CandTokens,
+		CacheReadTokens: parsed.UsageMetadata.CachedTokens,
+		Model:           model,
+		Provider:        providerName,
 	}, nil
 }
 
@@ -1237,6 +1252,9 @@ func doJSONPost(ctx context.Context, client *http.Client, endpoint string, heade
 		msg = RedactSecret(msg, secret)
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 			return nil, &AuthError{Status: resp.StatusCode, Msg: msg}
+		}
+		if isModelNotFound(resp.StatusCode, body) {
+			return nil, &ModelNotFoundError{Status: resp.StatusCode, Detail: msg}
 		}
 		return nil, fmt.Errorf("%s", msg)
 	}

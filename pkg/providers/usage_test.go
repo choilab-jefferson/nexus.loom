@@ -39,3 +39,33 @@ func TestOutputTokensParsedPerProvider(t *testing.T) {
 		})
 	}
 }
+
+func TestCacheTokensParsedPerProvider(t *testing.T) {
+	cases := map[string]struct {
+		body         string
+		mk           func(url string) Provider
+		create, read int
+	}{
+		"openai": {`{"choices":[{"finish_reason":"stop","message":{"content":"x"}}],"usage":{"prompt_tokens":30,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":20}}}`,
+			func(u string) Provider { return NewOpenAIProvider(u, "k", "m", false) }, 0, 20},
+		"anthropic": {`{"stop_reason":"end_turn","content":[{"type":"text","text":"x"}],"usage":{"input_tokens":3,"output_tokens":1,"cache_creation_input_tokens":5,"cache_read_input_tokens":9}}`,
+			func(u string) Provider { return NewAnthropicProvider(u, "k", "m", false) }, 5, 9},
+		"gemini": {`{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"x"}]}}],"usageMetadata":{"promptTokenCount":30,"candidatesTokenCount":1,"cachedContentTokenCount":12}}`,
+			func(u string) Provider { return NewGeminiProvider(u, "k", "m", false) }, 0, 12},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(c.body))
+			}))
+			defer srv.Close()
+			resp, err := c.mk(srv.URL).Chat(context.Background(), compact.PrefixHeader{SystemPrompt: "s"}, []compact.Message{{Role: "user", Content: "hi"}}, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.CacheCreationTokens != c.create || resp.CacheReadTokens != c.read {
+				t.Fatalf("cache = %d/%d, want %d/%d", resp.CacheCreationTokens, resp.CacheReadTokens, c.create, c.read)
+			}
+		})
+	}
+}

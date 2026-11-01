@@ -305,3 +305,23 @@ func TestRepeatedPolicyViolationHitsStrikeLimit(t *testing.T) {
 		t.Fatalf("expected tool_error_strikes, got %d %s", res.ExitCode, res.Status)
 	}
 }
+
+type modelErrProvider struct{ calls int }
+
+func (m *modelErrProvider) Chat(context.Context, compact.PrefixHeader, []compact.Message, int) (providers.Response, error) {
+	m.calls++
+	return providers.Response{}, &providers.ModelNotFoundError{Provider: "gemini", Model: "nope", Status: 404}
+}
+
+func TestModelNotFoundExits2NoRetry(t *testing.T) {
+	pol := policy.DefaultPolicyConfig(t.TempDir())
+	mp := &modelErrProvider{}
+	var tr bytes.Buffer
+	res := RunTask(context.Background(), TaskSpec{TaskID: "t", Instruction: "go"}, pol, mp, trace.NewWriter(&tr))
+	if res.ExitCode != policy.ExitHarnessErr || res.Status != "model_not_found" || mp.calls != 1 {
+		t.Fatalf("got %d %s calls=%d", res.ExitCode, res.Status, mp.calls)
+	}
+	if !strings.Contains(res.Output, `model "nope" not found`) || !strings.Contains(tr.String(), `"reason":"model_not_found"`) {
+		t.Fatalf("output=%q trace=%s", res.Output, tr.String())
+	}
+}

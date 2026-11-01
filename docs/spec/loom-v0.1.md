@@ -84,6 +84,9 @@ All tool schemas are deterministically sorted by name in `CanonicalToolSchemasJS
 
 ### 5.2 Provider Implementations
 
+Model ids are never validated against a built-in list. A 404 (or a 400 naming an unknown/unsupported model) from the provider becomes `ModelNotFoundError`: exit 2, status `model_not_found`, no retry. `loom models --provider P` lists served ids (Gemini `GET /v1beta/models`, OpenAI-compatible `GET /v1/models`, Anthropic `GET /v1/models`, Ollama `GET /api/tags`). Defaults: see docs/contract.md "Models".
+
+
 1. **`OllamaProvider` (`ollama`)**: Calls `POST /api/chat` with `stream: false`, `keep_alive: -1`, and fixed `options.num_ctx: 32768`. Under `PHIMode`, verifies the endpoint resolves to loopback or RFC1918 private IP (`IsLocalEndpoint`).
 2. **`OpenAIProvider` (`openai`)**: Calls `POST /v1/chat/completions` using `ResolveAPIKey("NEXUS_OPENAI_API_KEY", "OPENAI_API_KEY", "LOOM_API_KEY")`. Refused under `PHIMode` unless pointed at a local loopback/private endpoint.
 3. **`AnthropicProvider` (`anthropic`, `anthropic-api`)**: Resolves `NEXUS_ANTHROPIC_API_KEY` / `ANTHROPIC_API_KEY` (default model `"claude-sonnet-5-5"`). Calls `POST https://api.anthropic.com/v1/messages` with `cache_control: {"type": "ephemeral"}` on the frozen system block and tool schema list, and full multi-turn `tool_use` / `tool_result` content block serialization. Always refused under `PHIMode`.

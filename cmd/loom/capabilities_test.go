@@ -54,3 +54,17 @@ func TestCapabilitiesVersionAndCommit(t *testing.T) {
 		}
 	}
 }
+
+func TestCapabilitiesListsModelsSubcommand(t *testing.T) {
+	m := capabilitiesMap()
+	found := false
+	for _, s := range m["subcommands"].([]string) {
+		found = found || s == "models"
+	}
+	if !found || m["default_models"].(map[string]string)["gemini"] != "gemini-3.8-flash" {
+		t.Fatalf("%v", m)
+	}
+	if runModels(nil) != 2 || runModels([]string{"--provider", "typesafe"}) != 2 {
+		t.Fatal("models errors must exit 2")
+	}
+}

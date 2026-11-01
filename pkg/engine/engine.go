@@ -131,6 +131,7 @@ type TaskResult struct {
 	Escalation    *EscalationPayload `json:"escalation,omitempty"`
 	RunID         string             `json:"run_id,omitempty"`
 	Usage         Usage              `json:"usage"`
+	FilesChanged  FilesChanged       `json:"files_changed"`
 }
 
 // Usage is cumulative provider-reported token usage for a run.
@@ -138,6 +139,9 @@ type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+	// Cache tokens, cumulative; omitted when no provider reported them.
+	CacheCreationTokens int `json:"cache_creation_tokens,omitempty"`
+	CacheReadTokens     int `json:"cache_read_tokens,omitempty"`
 }
 
 // Checkpoint is the resumable loop state written after every completed turn.
@@ -148,12 +152,16 @@ type Checkpoint struct {
 	Msgs        []compact.Message `json:"msgs"`
 	Usage       Usage             `json:"usage"`
 	Compactions int               `json:"compactions"`
+	// Baseline is the workspace snapshot taken at the first start; absent in old checkpoints.
+	Baseline *Snapshot `json:"baseline,omitempty"`
 }
 
 // RunOptions carries optional resume/checkpoint hooks.
 type RunOptions struct {
 	Resume       *Checkpoint
 	OnCheckpoint func(Checkpoint)
+	// TracePath, when set, excludes loom's own trace/checkpoint files from files_changed.
+	TracePath string
 }
 
 // runState is mutated by runTask so the RunTaskWithOptions wrapper can emit
@@ -163,6 +171,8 @@ type runState struct {
 	usage  Usage
 	reason string
 	opts   RunOptions
+	// baseline is the workspace snapshot from the first start of the logical run.
+	baseline *Snapshot
 }
 
 func newRunID() string {
@@ -198,6 +208,12 @@ func RunTaskWithOptions(ctx context.Context, spec TaskSpec, pol *policy.PolicyCo
 	if opts.Resume != nil {
 		st.runID = opts.Resume.RunID
 		st.usage = opts.Resume.Usage
+		st.baseline = opts.Resume.Baseline
+	}
+	exclude := loomOwnedExcluder(opts.TracePath)
+	if st.baseline == nil && pol != nil {
+		// Fresh run, or resume from an old checkpoint without a baseline (snapshot at resume time).
+		st.baseline = TakeSnapshot(pol.Workspace, exclude)
 	}
 	res := runTask(ctx, spec, pol, prov, traceWriter, st)
 	res.SchemaVersion = SchemaVersion
@@ -206,6 +222,10 @@ func RunTaskWithOptions(ctx context.Context, spec TaskSpec, pol *policy.PolicyCo
 	}
 	res.RunID = st.runID
 	res.Usage = st.usage
+	res.FilesChanged = emptyFilesChanged()
+	if pol != nil {
+		res.FilesChanged = DiffSnapshots(st.baseline, TakeSnapshot(pol.Workspace, exclude))
+	}
 	done := map[string]any{
 		"t":         "done",
 		"status":    res.Status,
@@ -396,6 +416,17 @@ func runTask(ctx context.Context, spec TaskSpec, pol *policy.PolicyConfig, prov 
 					Compactions: compactions,
 				}
 			}
+			if providers.IsModelNotFound(err) {
+				st.reason = "model_not_found"
+				return TaskResult{
+					ExitCode:    policy.ExitHarnessErr,
+					Status:      "model_not_found",
+					Output:      err.Error(),
+					Turns:       turn,
+					PrefixHash:  frozenHash,
+					Compactions: compactions,
+				}
+			}
 			if providers.IsAuthError(err) {
 				return TaskResult{
 					ExitCode:    policy.ExitHarnessErr,
@@ -421,19 +452,35 @@ func runTask(ctx context.Context, spec TaskSpec, pol *policy.PolicyConfig, prov 
 			stopReason = resp.StopReason
 		}
 
-		_ = traceWriter.Emit(map[string]any{
+		st.usage.PromptTokens += resp.PromptTokens
+		st.usage.CompletionTokens += resp.OutputTokens
+		st.usage.TotalTokens = st.usage.PromptTokens + st.usage.CompletionTokens
+		st.usage.CacheCreationTokens += resp.CacheCreationTokens
+		st.usage.CacheReadTokens += resp.CacheReadTokens
+
+		stopEv := map[string]any{
 			"t":                 "stop",
+			"turn":              turn,
 			"reason":            string(stopReason),
 			"raw_reason":        resp.RawStopReason,
 			"provider":          resp.Provider,
 			"prompt_eval_count": resp.PromptEvalCount,
 			"prompt_tokens":     resp.PromptTokens,
 			"output_tokens":     resp.OutputTokens,
-		})
-
-		st.usage.PromptTokens += resp.PromptTokens
-		st.usage.CompletionTokens += resp.OutputTokens
-		st.usage.TotalTokens = st.usage.PromptTokens + st.usage.CompletionTokens
+			"total_tokens":      resp.PromptTokens + resp.OutputTokens,
+			"cumulative": map[string]any{
+				"prompt_tokens": st.usage.PromptTokens,
+				"output_tokens": st.usage.CompletionTokens,
+				"total_tokens":  st.usage.TotalTokens,
+			},
+		}
+		if resp.CacheCreationTokens > 0 {
+			stopEv["cache_creation_tokens"] = resp.CacheCreationTokens
+		}
+		if resp.CacheReadTokens > 0 {
+			stopEv["cache_read_tokens"] = resp.CacheReadTokens
+		}
+		_ = traceWriter.Emit(stopEv)
 		if maxTotal > 0 && st.usage.TotalTokens > maxTotal {
 			st.reason = "max_total_tokens"
 			return TaskResult{
@@ -675,6 +722,7 @@ func runTask(ctx context.Context, spec TaskSpec, pol *policy.PolicyConfig, prov 
 				Msgs:        append([]compact.Message(nil), msgs...),
 				Usage:       st.usage,
 				Compactions: compactions,
+				Baseline:    st.baseline,
 			})
 			_ = traceWriter.Emit(map[string]any{"t": "checkpoint", "turn": turn, "run_id": st.runID})
 		}
