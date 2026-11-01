@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -33,12 +34,20 @@ func (e *EscalationSignal) Error() string {
 
 // ToolResult holds the sanitized result of an in-process tool execution.
 type ToolResult struct {
-	Output      string            `json:"output"`
-	BytesRaw    int               `json:"bytes_raw"`
-	BytesPassed int               `json:"bytes_passed"`
-	Truncated   bool              `json:"truncated"`
-	IsError     bool              `json:"is_error,omitempty"`
-	Escalation  *EscalationSignal `json:"escalation,omitempty"`
+	Output      string `json:"output"`
+	BytesRaw    int    `json:"bytes_raw"`
+	BytesPassed int    `json:"bytes_passed"`
+	Truncated   bool   `json:"truncated"`
+	IsError     bool   `json:"is_error,omitempty"`
+	// ExitCode/TimedOut are set only by run_command. ExitCode is the child's
+	// exit status, or -1 when it was killed by a signal (including the timeout
+	// kill) or could not be started.
+	ExitCode *int `json:"exit_code,omitempty"`
+	TimedOut bool `json:"timed_out,omitempty"`
+	// ViolationKind is set when a recoverable policy violation was converted
+	// into this tool error (see policy.ViolationKind).
+	ViolationKind string            `json:"violation_kind,omitempty"`
+	Escalation    *EscalationSignal `json:"escalation,omitempty"`
 }
 
 // ToolSchema represents a normalized tool definition (§6.1).
@@ -155,7 +164,8 @@ func CanonicalToolSchemasJSON() string {
 }
 
 // Execute runs a built-in tool confined by cfg.
-// Fatal policy violations return a *policy.ViolationError (Exit Code 2).
+// Fatal policy violations return a *policy.ViolationError (Exit Code 2); recoverable kinds
+// (allowlist mismatch, eval flags) are returned as IsError results with ViolationKind set.
 func Execute(ctx context.Context, name string, args map[string]any, cfg *policy.PolicyConfig) (ToolResult, error) {
 	if cfg == nil {
 		return ToolResult{}, &policy.ViolationError{Reason: "nil PolicyConfig"}
@@ -163,6 +173,7 @@ func Execute(ctx context.Context, name string, args map[string]any, cfg *policy.
 	var (
 		rawOut string
 		err    error
+		meta   *runMeta
 	)
 	switch name {
 	case "read_file":
@@ -176,7 +187,7 @@ func Execute(ctx context.Context, name string, args map[string]any, cfg *policy.
 	case "write_file":
 		rawOut, err = execWriteFile(args, cfg)
 	case "run_command":
-		rawOut, err = execRunCommand(ctx, args, cfg)
+		rawOut, meta, err = execRunCommand(ctx, args, cfg)
 	case "escalate":
 		sig := parseEscalation(args)
 		outBytes, _ := json.Marshal(sig)
@@ -196,13 +207,45 @@ func Execute(ctx context.Context, name string, args map[string]any, cfg *policy.
 	}
 
 	if err != nil {
-		if policy.IsViolation(err) {
-			return ToolResult{}, err
+		if kind, ok := policy.ViolationKindOf(err); ok {
+			if !kind.Recoverable() {
+				return ToolResult{}, err
+			}
+			res := clampResult(fmt.Sprintf("error: %v", err), true, cfg.MaxOutputBytes)
+			res.ViolationKind = kind.String()
+			return res, nil
 		}
 		errMsg := fmt.Sprintf("error: %v", err)
 		return clampResult(errMsg, true, cfg.MaxOutputBytes), nil
 	}
-	return clampResult(rawOut, false, cfg.MaxOutputBytes), nil
+	res := clampResult(rawOut, false, cfg.MaxOutputBytes)
+	if meta != nil {
+		res.ExitCode = &meta.exitCode
+		res.TimedOut = meta.timedOut
+		res.Truncated = res.Truncated || meta.truncated
+	}
+	return res, nil
+}
+
+func truncMarker(dropped int) string {
+	return fmt.Sprintf("\n[loom:truncated %d bytes in middle]\n", dropped)
+}
+
+// splitHeadTail keeps about 1/3 of maxBytes from the start and 2/3 from the end
+// of raw, cutting on UTF-8 boundaries. dropped is the byte count removed.
+func splitHeadTail(raw string, maxBytes int) (head, tail string, dropped int) {
+	h := maxBytes / 3
+	for h > 0 && h < len(raw) && !utf8.RuneStart(raw[h]) {
+		h--
+	}
+	t := len(raw) - (maxBytes - maxBytes/3)
+	if t < h {
+		t = h
+	}
+	for t < len(raw) && !utf8.RuneStart(raw[t]) {
+		t++
+	}
+	return raw[:h], raw[t:], t - h
 }
 
 func clampResult(raw string, isErr bool, maxBytes int) ToolResult {
@@ -219,12 +262,11 @@ func clampResult(raw string, isErr bool, maxBytes int) ToolResult {
 			IsError:     isErr,
 		}
 	}
-	suffix := fmt.Sprintf("\n...[loom:truncated %d of %d bytes]", bytesRaw-maxBytes, bytesRaw)
-	cut := raw[:maxBytes]
+	head, tail, dropped := splitHeadTail(raw, maxBytes)
 	return ToolResult{
-		Output:      cut + suffix,
+		Output:      head + truncMarker(dropped) + tail,
 		BytesRaw:    bytesRaw,
-		BytesPassed: len(cut),
+		BytesPassed: len(head) + len(tail),
 		Truncated:   true,
 		IsError:     isErr,
 	}
@@ -441,6 +483,33 @@ var safeEnvKeys = map[string]bool{
 	"LANG": true, "LANGUAGE": true, "TERM": true, "TZ": true, "TMPDIR": true,
 	"GOPATH": true, "GOCACHE": true, "GOMODCACHE": true, "GOROOT": true, "GOFLAGS": true,
 	"CARGO_HOME": true, "RUSTUP_HOME": true, "VIRTUAL_ENV": true,
+	// Non-secret ML defaults.
+	"PYTHONPATH": true, "PYTHONUNBUFFERED": true, "PYTHONHASHSEED": true,
+	"CUDA_VISIBLE_DEVICES": true, "CUDA_HOME": true,
+	"HF_HOME": true, "HF_HUB_CACHE": true, "HF_DATASETS_CACHE": true, "TRANSFORMERS_CACHE": true,
+	"OMP_NUM_THREADS": true,
+}
+
+// envPassed reports whether key is allowed through to a child. Secret-looking
+// names pass only when named exactly in passEnv (never via a prefix pattern).
+func envPassed(key string, passEnv []string) bool {
+	if policy.IsSecretEnvName(key) {
+		for _, p := range passEnv {
+			if p == key {
+				return true
+			}
+		}
+		return false
+	}
+	if safeEnvKeys[key] || strings.HasPrefix(key, "LC_") || strings.HasPrefix(key, "CUDA_") {
+		return true
+	}
+	for _, p := range passEnv {
+		if p == key || (strings.HasSuffix(p, "*") && strings.HasPrefix(key, strings.TrimSuffix(p, "*"))) {
+			return true
+		}
+	}
+	return false
 }
 
 const (
@@ -449,11 +518,12 @@ const (
 	runWaitDelay     = 2 * time.Second
 )
 
-func scrubSubprocessEnv(env []string, argv0 string) []string {
+// scrubSubprocessEnv filters env to the allowlist plus the optional passEnv extras.
+func scrubSubprocessEnv(env []string, argv0 string, passEnv ...string) []string {
 	out := make([]string, 0, len(env)+2)
 	for _, kv := range env {
 		key, _, _ := strings.Cut(kv, "=")
-		if safeEnvKeys[key] || strings.HasPrefix(key, "LC_") {
+		if envPassed(key, passEnv) {
 			out = append(out, kv)
 		}
 	}
@@ -465,45 +535,97 @@ func scrubSubprocessEnv(env []string, argv0 string) []string {
 	return out
 }
 
-// cappedBuffer keeps the first max bytes and silently discards the rest, so a
-// runaway writer never blocks or grows memory.
+// cappedBuffer keeps the first max/3 bytes plus a ring of the last max-max/3
+// bytes, so a runaway writer never blocks or grows memory while the end of the
+// output (tracebacks, test summaries) survives.
 type cappedBuffer struct {
-	mu        sync.Mutex
-	buf       bytes.Buffer
-	max       int
-	truncated bool
+	mu      sync.Mutex
+	max     int
+	head    []byte
+	ring    []byte // len == tail capacity once allocated
+	ringPos int    // next write index
+	ringLen int    // valid bytes in ring (<= len(ring))
+	total   int
 }
 
 func (c *cappedBuffer) Write(p []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if room := c.max - c.buf.Len(); room > 0 {
-		if len(p) > room {
-			c.buf.Write(p[:room])
-			c.truncated = true
-		} else {
-			c.buf.Write(p)
-		}
-	} else if len(p) > 0 {
-		c.truncated = true
+	n := len(p)
+	c.total += n
+	headMax := c.max / 3
+	if room := headMax - len(c.head); room > 0 {
+		k := min(room, len(p))
+		c.head = append(c.head, p[:k]...)
+		p = p[k:]
 	}
-	return len(p), nil
+	if len(p) == 0 {
+		return n, nil
+	}
+	if c.ring == nil {
+		c.ring = make([]byte, c.max-headMax)
+	}
+	if len(p) >= len(c.ring) {
+		p = p[len(p)-len(c.ring):]
+		c.ringPos, c.ringLen = 0, 0
+	}
+	for len(p) > 0 {
+		k := copy(c.ring[c.ringPos:], p)
+		p = p[k:]
+		c.ringPos = (c.ringPos + k) % len(c.ring)
+		c.ringLen = min(c.ringLen+k, len(c.ring))
+	}
+	return n, nil
+}
+
+func (c *cappedBuffer) truncated() bool { return c.total > len(c.head)+c.ringLen }
+
+// String returns head + marker + tail when bytes were dropped, else all bytes.
+func (c *cappedBuffer) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	tail := make([]byte, 0, c.ringLen)
+	if c.ringLen == len(c.ring) && c.ringLen > 0 {
+		tail = append(tail, c.ring[c.ringPos:]...)
+		tail = append(tail, c.ring[:c.ringPos]...)
+	} else {
+		tail = append(tail, c.ring[:c.ringLen]...)
+	}
+	if !c.truncated() {
+		return string(c.head) + string(tail)
+	}
+	h, t := string(c.head), string(tail)
+	// Trim partial runes at the cut edges (at most UTFMax-1 bytes each).
+	hb := len(h)
+	for i := 0; i < utf8.UTFMax && hb > 0; i++ {
+		if r, sz := utf8.DecodeLastRuneInString(h[:hb]); r == utf8.RuneError && sz <= 1 {
+			hb--
+		} else {
+			break
+		}
+	}
+	ts := 0
+	for ts < len(t) && ts < utf8.UTFMax && !utf8.RuneStart(t[ts]) {
+		ts++
+	}
+	dropped := c.total - hb - (len(t) - ts)
+	return h[:hb] + truncMarker(dropped) + t[ts:]
 }
 
 // execRunCommand runs an allowlisted argv. NOT a sandbox: the child has the
 // harness user's full filesystem/network access; policy only gates argv.
-func execRunCommand(ctx context.Context, args map[string]any, cfg *policy.PolicyConfig) (string, error) {
+func execRunCommand(ctx context.Context, args map[string]any, cfg *policy.PolicyConfig) (string, *runMeta, error) {
 	argv := getStringSlice(args, "argv")
 	if err := policy.ValidateCommandArgv(argv, cfg); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	wsReal, err := policy.ResolveScopedPath(cfg.Workspace, ".", false, cfg)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	resolved, err := policy.ResolveArgv0(argv[0], cfg.Workspace)
 	if err != nil {
-		return "", &policy.ViolationError{Reason: fmt.Sprintf("cannot resolve executable %q: %v", argv[0], err)}
+		return "", nil, &policy.ViolationError{Reason: fmt.Sprintf("cannot resolve executable %q: %v", argv[0], err)}
 	}
 	timeoutSec := getInt(args, "timeout_s", 30)
 	if timeoutSec <= 0 {
@@ -521,7 +643,7 @@ func execRunCommand(ctx context.Context, args map[string]any, cfg *policy.Policy
 	// path is the symlink target.
 	cmd.Args[0] = argv[0]
 	cmd.Dir = wsReal
-	cmd.Env = scrubSubprocessEnv(os.Environ(), argv[0])
+	cmd.Env = scrubSubprocessEnv(os.Environ(), argv[0], cfg.PassEnv...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	cmd.WaitDelay = runWaitDelay
@@ -534,14 +656,25 @@ func execRunCommand(ctx context.Context, args map[string]any, cfg *policy.Policy
 	if cmd.Process != nil {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
-	out := combined.buf.String()
-	if combined.truncated {
-		out += fmt.Sprintf("\n[output truncated at %d bytes]", maxRunOutput)
+	out := combined.String()
+	meta := &runMeta{truncated: combined.truncated()}
+	if runErr == nil {
+		return out, meta, nil
 	}
-	if runErr != nil {
-		return fmt.Sprintf("%s\n[exit_error: %v]", strings.TrimSpace(out), runErr), nil
+	meta.exitCode = -1
+	var ee *exec.ExitError
+	if errors.As(runErr, &ee) {
+		meta.exitCode = ee.ExitCode()
 	}
-	return out, nil
+	meta.timedOut = errors.Is(runCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
+	return fmt.Sprintf("%s\n[exit_error: %v]", strings.TrimSpace(out), runErr), meta, nil
+}
+
+// runMeta is the structured outcome of a run_command execution.
+type runMeta struct {
+	exitCode  int
+	timedOut  bool
+	truncated bool
 }
 
 func parseEscalation(args map[string]any) *EscalationSignal {

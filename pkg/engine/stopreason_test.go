@@ -73,7 +73,7 @@ func TestMaxOutputTokensConfigurable(t *testing.T) {
 		spec int
 		env  string
 		want int
-	}{{0, "", 2048}, {0, "4096", 4096}, {1000, "4096", 1000}} {
+	}{{0, "", 8192}, {0, "4096", 4096}, {1000, "4096", 1000}} {
 		t.Setenv("LOOM_MAX_OUTPUT_TOKENS", c.env)
 		got := 0
 		var buf bytes.Buffer
@@ -109,5 +109,20 @@ func TestSchemaVersionOnResultAndTrace(t *testing.T) {
 		if err := json.Unmarshal([]byte(l), &ev); err != nil || ev["schema_version"] != float64(1) {
 			t.Fatalf("trace event lacks schema_version: %s", l)
 		}
+	}
+}
+
+func TestMaxTokensHintAndPrecedence(t *testing.T) {
+	res := runOnce(t, TaskSpec{}, providers.Response{Content: "cut off", RawStopReason: "max_tokens"})
+	if !strings.Contains(res.Output, "--max-output-tokens") || !strings.Contains(res.Output, "LOOM_MAX_OUTPUT_TOKENS") || !strings.HasPrefix(res.Output, "cut off") {
+		t.Fatalf("missing hint: %q", res.Output)
+	}
+	t.Setenv("LOOM_MAX_OUTPUT_TOKENS", "")
+	if resolveMaxOutputTokens(0) != providers.DefaultMaxOutputTokens || providers.DefaultMaxOutputTokens != 8192 {
+		t.Fatal("default should be 8192")
+	}
+	t.Setenv("LOOM_MAX_OUTPUT_TOKENS", "100")
+	if resolveMaxOutputTokens(0) != 100 || resolveMaxOutputTokens(7) != 7 {
+		t.Fatal("precedence spec > env broken")
 	}
 }

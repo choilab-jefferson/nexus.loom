@@ -23,7 +23,7 @@ Loom v0.1 is the Nexus in-house, zero-dependency Go leaf execution harness desig
 | **I1** | Bounded Single-Agent Leaf Loop & `StopReason` Normalization | Loom is strictly a leaf executor (`max_turns` bounded, no recursive sub-agent dispatch tool). Provider stop strings are normalized to 5 canonical kinds (`end_turn`, `tool_use`, `max_tokens`, `error`, `unknown`). If `len(ToolCalls) > 0`, `StopToolUse` is forced regardless of raw vendor `finish_reason`. `StopUnknown` retries once, then exits `2` if persistent. |
 | **I2** | Prefix Immutability | `PrefixHeader` (`SystemPrompt` + canonical sorted `ToolSchemasJSON` + `RepoSummary` from `AGENTS.md`) is frozen at run start. Its SHA-256 digest (`PrefixHash()`) is verified before every turn and logged in JSONL traces (`frozen_prefix_hash`, `rendered_prefix_hash`). Volatile state such as Nexus STM is placed in the initial user turn, never the system prefix. Any mid-run mutation exits `2`. |
 | **I3** | Prefix-Preserving Pre-Send Compaction | Before every `Provider.Chat` call, `CompactMessages` estimates total context tokens (`max(1, len(s)/4)`). When tokens exceed `maxContextTokens`, older `tool` messages outside the `keepRecent` window are deterministically folded into `[loom:folded turn=N sha256=... bytes=... lines=... preview=...]` while preserving `PrefixHeader`, the initial user task prompt, and salient test/linter error lines (`FAIL`, `ERROR`, `AssertionError`, `panic`). |
-| **I4** | Capability Intersection & Workspace Confinement | Every file operation resolves symlinks (`ResolveScopedPath` via `filepath.EvalSymlinks` walk) and blocks paths escaping `Workspace` or matching `DenyGlobs` (`.git/**`, `.env*`). Command execution (`run_command`) forbids shell wrappers (`sh`, `bash`, `zsh`, `eval`, `make`, `npm`, `npx`, `uvx`, `sudo`), passes only an allowlisted child environment (everything else dropped), resolves argv[0] via `exec.LookPath` and rejects workspace binaries, bounds timeout (300s) and output (1 MiB), kills the process group; `run_command` is NOT a sandbox (child keeps the user's filesystem/network access), and validates `argv` token prefixes against `IntersectAllowCommands(global, agent, task)` (global/agent layers from `LOOM_GLOBAL_ALLOW_COMMANDS` / `LOOM_AGENT_ALLOW_COMMANDS`, `;`-separated). Any violation returns `*policy.ViolationError` and exits immediately with code `2`. |
+| **I4** | Capability Intersection & Workspace Confinement | Every file operation resolves symlinks (`ResolveScopedPath` via `filepath.EvalSymlinks` walk) and blocks paths escaping `Workspace` or matching `DenyGlobs` (`.git/**`, `.env*`). Command execution (`run_command`) forbids shell wrappers (`sh`, `bash`, `zsh`, `eval`, `make`, `npm`, `npx`, `uvx`, `sudo`), passes only an allowlisted child environment (everything else dropped), resolves argv[0] via `exec.LookPath` and rejects workspace binaries, bounds timeout (300s) and output (1 MiB), kills the process group; `run_command` is NOT a sandbox (child keeps the user's filesystem/network access), and validates `argv` token prefixes against `IntersectAllowCommands(global, agent, task)` (global/agent layers from `LOOM_GLOBAL_ALLOW_COMMANDS` / `LOOM_AGENT_ALLOW_COMMANDS`, `;`-separated). Path escape, symlink writes and PHI cloud refusal return `*policy.ViolationError` (Kind `fatal`) and exit immediately with code `2`; command-policy violations (allowlist mismatch, shell wrapper, interpreter eval flag) are recoverable: returned to the model as a tool error (trace `policy_violation_recovered`, counted toward the tool-error strike limit). |
 
 ---
 
@@ -111,13 +111,16 @@ All tool schemas are deterministically sorted by name in `CanonicalToolSchemasJS
 # Task-file execution mode
 loom run --agent <name> --task-file <task.json> --workspace <dir> \
   [--provider ollama|openai|anthropic|anthropic-api|gemini|gemini-api|google-agent-platform|typesafe|mock] \
-  [--model <m>] [--trace <jsonl>] [--phi] [--no-agents-md] [--no-stm] [--non-interactive] [--no-daemon] [--json]
+  [--model <m>] [--trace <jsonl>] [--phi] [--no-agents-md] [--no-stm] [--non-interactive] [--no-daemon] [--json] \
+  [--allow-cmd "pytest"] [--pass-env NAME[,PREFIX*]] [--max-output-tokens N]
+# run: --allow-cmd is UNIONed with task.json constraints.allow_commands, then intersected with global/agent layers
 
 # Single-shot prompt mode
 loom -p "<instruction>" [--workspace <dir>] \
   [--provider ollama|openai|anthropic|anthropic-api|gemini|gemini-api|google-agent-platform|typesafe|mock] \
   [--model <m>] [--max-turns 8] [--max-context-tokens 28000] \
-  [--allow-cmd "pytest"] [--trace <jsonl>] [--phi] [--no-agents-md] [--no-stm] [--json]
+  [--allow-cmd "pytest"] [--pass-env NAME[,PREFIX*]] [--max-output-tokens N] \
+  [--trace <jsonl>] [--phi] [--no-agents-md] [--no-stm] [--json]
 
 # Inspect workspace Nexus STM brief
 loom stm [--workspace <dir>] [--phi] [--json]

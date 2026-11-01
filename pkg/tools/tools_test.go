@@ -2,11 +2,13 @@ package tools
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/choilab-jefferson/nexus.loom/pkg/policy"
 )
@@ -78,11 +80,14 @@ func TestBuiltinToolsAndPolicyEnforcement(t *testing.T) {
 		t.Errorf("unexpected run_command output: %q", cmdRes.Output)
 	}
 
-	_, err = Execute(ctx, "run_command", map[string]any{
+	disallowed, err := Execute(ctx, "run_command", map[string]any{
 		"argv": []string{"rm", "-rf", "/"},
 	}, cfg)
-	if !policy.IsViolation(err) {
-		t.Errorf("expected ViolationError on disallowed run_command, got %v", err)
+	if err != nil {
+		t.Errorf("disallowed run_command must be a recoverable tool error, got %v", err)
+	}
+	if !disallowed.IsError || disallowed.ViolationKind != "allowlist" {
+		t.Errorf("expected IsError result with kind allowlist, got %+v", disallowed)
 	}
 
 	// 6. escalate
@@ -251,5 +256,123 @@ func TestRunCommandPreservesArgv0ForMultiCall(t *testing.T) {
 	}
 	if !strings.Contains(res.Output, "applet-ok") {
 		t.Fatalf("argv0 not preserved: %q", res.Output)
+	}
+}
+
+func TestClampResultKeepsHeadAndTail(t *testing.T) {
+	tb := "Traceback (most recent call last):\n  File \"x.py\", line 1\nValueError: boom\n"
+	raw := strings.Repeat("line of noise\n", 8000) + tb // ~110 KB
+	res := clampResult(raw, false, 16384)
+	if !res.Truncated || res.BytesRaw != len(raw) {
+		t.Fatalf("flags: %+v", res)
+	}
+	if !strings.HasSuffix(res.Output, tb) || !strings.Contains(res.Output, "[loom:truncated ") || !strings.Contains(res.Output, " bytes in middle]") {
+		t.Fatalf("tail/marker missing: %q", res.Output[len(res.Output)-200:])
+	}
+	if !strings.HasPrefix(res.Output, "line of noise") || res.BytesPassed > 16384 {
+		t.Fatalf("head/passed wrong: %d", res.BytesPassed)
+	}
+}
+
+func TestClampResultUTF8Boundaries(t *testing.T) {
+	raw := strings.Repeat("한", 5000)
+	for max := 100; max < 112; max++ {
+		res := clampResult(raw, false, max)
+		if !utf8.ValidString(res.Output) {
+			t.Fatalf("max=%d invalid utf8", max)
+		}
+	}
+}
+
+func TestCappedBufferHeadAndRingTail(t *testing.T) {
+	c := &cappedBuffer{max: 300}
+	var all strings.Builder
+	for i := 0; i < 200; i++ {
+		s := fmt.Sprintf("row-%03d;", i)
+		all.WriteString(s)
+		c.Write([]byte(s))
+	}
+	out := c.String()
+	if !c.truncated() || !strings.HasPrefix(out, "row-000;") || !strings.HasSuffix(out, "row-199;") || !strings.Contains(out, "bytes in middle]") {
+		t.Fatalf("bad: %q", out)
+	}
+	small := &cappedBuffer{max: 300}
+	small.Write([]byte("hello"))
+	if small.truncated() || small.String() != "hello" {
+		t.Fatalf("small: %q", small.String())
+	}
+}
+
+func TestRunCommandStructuredResult(t *testing.T) {
+	ws := t.TempDir()
+	cfg := policy.DefaultPolicyConfig(ws)
+	self, _ := os.Executable()
+	cfg.AllowCommands = [][]string{{self}, {"sleep"}, {"yes"}}
+
+	res, err := Execute(context.Background(), "run_command", map[string]any{"argv": []string{self, "-test.run=TestHelperExit", "--", "loom-exit3"}}, cfg)
+	if err != nil || res.ExitCode == nil || *res.ExitCode != 3 || res.TimedOut {
+		t.Fatalf("exit3: %+v err=%v", res, err)
+	}
+	res, _ = Execute(context.Background(), "run_command", map[string]any{"argv": []string{"sleep", "30"}, "timeout_s": 1}, cfg)
+	if !res.TimedOut || res.ExitCode == nil || *res.ExitCode != -1 {
+		t.Fatalf("timeout: %+v", res)
+	}
+	res, _ = Execute(context.Background(), "run_command", map[string]any{"argv": []string{"sleep", "0"}}, cfg)
+	if res.ExitCode == nil || *res.ExitCode != 0 || res.TimedOut || res.Truncated {
+		t.Fatalf("ok: %+v", res)
+	}
+	res, _ = Execute(context.Background(), "run_command", map[string]any{"argv": []string{"yes"}, "timeout_s": 1}, cfg)
+	if !res.Truncated {
+		t.Fatalf("big output not truncated: %+v", res)
+	}
+}
+
+func TestHelperExit(t *testing.T) {
+	if len(os.Args) > 1 && os.Args[len(os.Args)-1] == "loom-exit3" {
+		os.Exit(3)
+	}
+}
+
+func envMap(env []string) map[string]string {
+	m := map[string]string{}
+	for _, kv := range env {
+		k, v, _ := strings.Cut(kv, "=")
+		m[k] = v
+	}
+	return m
+}
+
+func TestScrubEnvMLDefaultsAndPassEnv(t *testing.T) {
+	raw := []string{
+		"PATH=/bin", "PYTHONPATH=/p", "PYTHONUNBUFFERED=1", "CUDA_VISIBLE_DEVICES=0", "CUDA_HOME=/c", "CUDA_FOO=1",
+		"HF_HOME=/h", "TRANSFORMERS_CACHE=/t", "OMP_NUM_THREADS=4", "HF_TOKEN=hf-secret", "HF_FOO=1",
+		"MYAPP_A=1", "MYAPP_API_KEY=k", "MYAPP_TOKEN=tt", "OTHER=1",
+	}
+	m := envMap(scrubSubprocessEnv(raw, "/bin/x"))
+	for _, k := range []string{"PYTHONPATH", "PYTHONUNBUFFERED", "CUDA_VISIBLE_DEVICES", "CUDA_HOME", "CUDA_FOO", "HF_HOME", "TRANSFORMERS_CACHE", "OMP_NUM_THREADS"} {
+		if _, ok := m[k]; !ok {
+			t.Errorf("default %s dropped", k)
+		}
+	}
+	for _, k := range []string{"HF_TOKEN", "HF_FOO", "MYAPP_A", "OTHER"} {
+		if _, ok := m[k]; ok {
+			t.Errorf("%s should be dropped by default", k)
+		}
+	}
+	m = envMap(scrubSubprocessEnv(raw, "/bin/x", "HF_*", "MYAPP_*"))
+	if _, ok := m["HF_FOO"]; !ok {
+		t.Error("HF_* prefix should pass HF_FOO")
+	}
+	if _, ok := m["MYAPP_A"]; !ok {
+		t.Error("MYAPP_* prefix should pass MYAPP_A")
+	}
+	for _, k := range []string{"HF_TOKEN", "MYAPP_API_KEY", "MYAPP_TOKEN", "OTHER"} {
+		if _, ok := m[k]; ok {
+			t.Errorf("%s must stay blocked under a prefix", k)
+		}
+	}
+	m = envMap(scrubSubprocessEnv(raw, "/bin/x", "HF_*", "HF_TOKEN"))
+	if m["HF_TOKEN"] != "hf-secret" {
+		t.Error("exact HF_TOKEN should pass")
 	}
 }

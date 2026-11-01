@@ -25,6 +25,45 @@ const (
 // ViolationError represents an Invariant I4 or harness policy violation (Exit Code 2).
 type ViolationError struct {
 	Reason string
+	// Kind classifies the violation. The zero value (KindFatal) ends the run
+	// with ExitHarnessErr; other kinds are recoverable tool errors.
+	Kind ViolationKind
+}
+
+// ViolationKind is the typed class of a ViolationError.
+type ViolationKind int
+
+const (
+	// KindFatal: path escape, symlink write, PHI refusal, etc. Always exit 2 (I4).
+	KindFatal ViolationKind = iota
+	// KindAllowlist: command not on the allow_commands list. Recoverable.
+	KindAllowlist
+	// KindEvalFlag: shell/wrapper executable or inline-code/eval flag. Recoverable.
+	KindEvalFlag
+)
+
+// String returns the trace/contract name of the kind.
+func (k ViolationKind) String() string {
+	switch k {
+	case KindAllowlist:
+		return "allowlist"
+	case KindEvalFlag:
+		return "eval_flag"
+	default:
+		return "fatal"
+	}
+}
+
+// Recoverable reports whether the violation is returned to the model as a tool error.
+func (k ViolationKind) Recoverable() bool { return k == KindAllowlist || k == KindEvalFlag }
+
+// ViolationKindOf returns the Kind of err if it is or wraps a *ViolationError.
+func ViolationKindOf(err error) (ViolationKind, bool) {
+	var v *ViolationError
+	if errors.As(err, &v) {
+		return v.Kind, true
+	}
+	return KindFatal, false
 }
 
 func (e *ViolationError) Error() string {
@@ -43,11 +82,13 @@ func IsViolation(err error) bool {
 
 // PolicyConfig defines the capability and workspace scope for a Loom leaf run (Invariant I4).
 type PolicyConfig struct {
-	Workspace      string
-	ReadAllow      []string
-	WriteAllow     []string
-	DenyGlobs      []string
-	AllowCommands  [][]string
+	Workspace     string
+	ReadAllow     []string
+	WriteAllow    []string
+	DenyGlobs     []string
+	AllowCommands [][]string
+	// PassEnv extends the run_command env allowlist: exact names or PREFIX* patterns.
+	PassEnv        []string
 	MaxReadLines   int
 	MaxOutputBytes int
 	PHIMode        bool
@@ -344,23 +385,23 @@ func ValidateCommandArgv(argv []string, cfg *PolicyConfig) error {
 	}
 	base := filepath.Base(bin)
 	if forbiddenWrappers[base] {
-		return &ViolationError{Reason: fmt.Sprintf("forbidden shell or wrapper executable %q", base)}
+		return &ViolationError{Reason: fmt.Sprintf("forbidden shell or wrapper executable %q", base), Kind: KindEvalFlag}
 	}
 	interp := interpreterBase(base)
 	for _, arg := range argv[1:] {
 		if interp && interpreterEvalFlags[arg] {
-			return &ViolationError{Reason: fmt.Sprintf("forbidden interpreter inline-code flag %q for %q", arg, base)}
+			return &ViolationError{Reason: fmt.Sprintf("forbidden interpreter inline-code flag %q for %q", arg, base), Kind: KindEvalFlag}
 		}
 		if arg == "-c" || arg == "--eval" || strings.Contains(arg, "$(") || strings.Contains(arg, "`") {
-			return &ViolationError{Reason: fmt.Sprintf("forbidden shell evaluation argument %q", arg)}
+			return &ViolationError{Reason: fmt.Sprintf("forbidden shell evaluation argument %q", arg), Kind: KindEvalFlag}
 		}
 	}
 	if cfg == nil || len(cfg.AllowCommands) == 0 {
-		return &ViolationError{Reason: fmt.Sprintf("command %v rejected: allow_commands is empty (grant commands with -allow-cmd \"<prefix>\", e.g. -allow-cmd \"go test\", or task.json constraints.allow_commands)", argv)}
+		return &ViolationError{Reason: fmt.Sprintf("command %v rejected: allow_commands is empty (grant commands with -allow-cmd \"<prefix>\", e.g. -allow-cmd \"go test\", or task.json constraints.allow_commands)", argv), Kind: KindAllowlist}
 	}
 	resolved, rerr := ResolveArgv0(bin, cfg.Workspace)
 	if rerr != nil {
-		return &ViolationError{Reason: fmt.Sprintf("cannot resolve executable %q: %v", bin, rerr)}
+		return &ViolationError{Reason: fmt.Sprintf("cannot resolve executable %q: %v", bin, rerr), Kind: KindAllowlist}
 	}
 	for _, allowed := range cfg.AllowCommands {
 		if len(allowed) == 0 || !isTokenPrefixArgs(allowed, argv) {
@@ -370,7 +411,7 @@ func ValidateCommandArgv(argv []string, cfg *PolicyConfig) error {
 			return nil
 		}
 	}
-	return &ViolationError{Reason: fmt.Sprintf("command %v does not match any allow_commands entry (allowed prefixes: %s)", argv, formatAllowed(cfg.AllowCommands))}
+	return &ViolationError{Reason: fmt.Sprintf("command %v does not match any allow_commands entry (allowed prefixes: %s)", argv, formatAllowed(cfg.AllowCommands)), Kind: KindAllowlist}
 }
 
 func formatAllowed(list [][]string) string {

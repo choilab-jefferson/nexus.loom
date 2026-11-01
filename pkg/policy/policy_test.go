@@ -238,3 +238,26 @@ func TestInterpreterInlineFlagsBlocked(t *testing.T) {
 		}
 	}
 }
+
+func TestViolationKinds(t *testing.T) {
+	cfg := DefaultPolicyConfig(t.TempDir())
+	cfg.AllowCommands = [][]string{{"make"}}
+	cases := []struct {
+		argv []string
+		want ViolationKind
+	}{
+		{[]string{"rm", "-rf", "/"}, KindAllowlist},
+		{[]string{"bash", "-c", "echo hi"}, KindEvalFlag},
+		{[]string{"python3", "-c", "1"}, KindEvalFlag},
+	}
+	for _, c := range cases {
+		k, ok := ViolationKindOf(ValidateCommandArgv(c.argv, cfg))
+		if !ok || k != c.want || !k.Recoverable() {
+			t.Errorf("%v: got kind %v ok=%v, want %v", c.argv, k, ok, c.want)
+		}
+	}
+	_, err := ResolveScopedPath(t.TempDir(), "../escape", false, cfg)
+	if k, ok := ViolationKindOf(err); !ok || k.Recoverable() {
+		t.Errorf("path escape must stay fatal, got %v %v", k, ok)
+	}
+}

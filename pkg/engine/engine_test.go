@@ -271,3 +271,37 @@ func TestProviderAuthErrorExits2(t *testing.T) {
 		t.Fatalf("expected exit 2 auth_error, got %d %s", res.ExitCode, res.Status)
 	}
 }
+
+func TestRecoverablePolicyViolationContinuesAndTraces(t *testing.T) {
+	ws := t.TempDir()
+	pol := policy.DefaultPolicyConfig(ws)
+	mock := providers.NewScriptedMockProvider(
+		toolCallResp("1", "run_command", map[string]any{"argv": []string{"rm", "-rf", "/"}}),
+		toolCallResp("2", "run_command", map[string]any{"argv": []string{"bash", "-c", "ls"}}),
+		providers.Response{Content: "done", RawStopReason: "stop"},
+	)
+	var buf bytes.Buffer
+	spec := TaskSpec{TaskID: "t", Instruction: "go", Constraints: TaskConstraints{MaxTurns: 6}}
+	res := RunTask(context.Background(), spec, pol, mock, trace.NewWriter(&buf))
+	if res.ExitCode != policy.ExitOK {
+		t.Fatalf("expected run to continue, got %d %s (%s)", res.ExitCode, res.Status, res.Output)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `"t":"policy_violation_recovered"`) || !strings.Contains(out, `"kind":"allowlist"`) || !strings.Contains(out, `"kind":"eval_flag"`) {
+		t.Errorf("missing policy_violation_recovered events:\n%s", out)
+	}
+}
+
+func TestRepeatedPolicyViolationHitsStrikeLimit(t *testing.T) {
+	ws := t.TempDir()
+	pol := policy.DefaultPolicyConfig(ws)
+	var script []providers.Response
+	for i := 0; i < 6; i++ {
+		script = append(script, toolCallResp("c", "run_command", map[string]any{"argv": []string{"rm", "-rf", "/"}}))
+	}
+	spec := TaskSpec{TaskID: "t", Instruction: "go", Constraints: TaskConstraints{MaxTurns: 10}}
+	res := RunTask(context.Background(), spec, pol, providers.NewScriptedMockProvider(script...), trace.NewWriter(&bytes.Buffer{}))
+	if res.ExitCode != policy.ExitTaskFail || res.Status != "tool_error_strikes" {
+		t.Fatalf("expected tool_error_strikes, got %d %s", res.ExitCode, res.Status)
+	}
+}

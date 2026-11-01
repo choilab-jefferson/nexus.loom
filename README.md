@@ -42,7 +42,9 @@ Run `loom` with no arguments (exit 2) or `loom --help` (exit 0) for the full lis
 | `--provider` | `auto`, `ollama`, `openai`, `anthropic`, `gemini`, `google-agent-platform`, `typesafe`, `mock` |
 | `--model` | model id (provider default otherwise) |
 | `--workspace` | workspace root; all file access is confined here |
-| `--allow-cmd "git status"` | allow a command prefix for `run_command` (repeatable; none by default) |
+| `--allow-cmd "git status"` | allow a command prefix for `run_command` (repeatable; none by default). On `loom run` it is unioned with task.json `constraints.allow_commands`, then intersected with global/agent layers |
+| `--pass-env NAME[,NAME\|PREFIX*]` | extra env vars for `run_command` children (repeatable; also `run`/`resume`, spec `constraints.pass_env`). ML defaults (PYTHONPATH, CUDA_*, HF_HOME, ...) pass already; secrets (`*TOKEN*`, `*_API_KEY`, ...) only by exact name, with a warning |
+| `--max-output-tokens N` | per-response output cap (also `run`/`resume`); flag > spec > `LOOM_MAX_OUTPUT_TOKENS` > 8192 |
 | `--max-turns`, `--max-total-tokens`, `--deadline`, `--max-tool-calls` | budgets |
 | `--trace file.jsonl`, `--json` | trace output, machine-readable result |
 | `loom resume <trace>` | continue an interrupted run |

@@ -24,6 +24,10 @@ import (
 	"github.com/choilab-jefferson/nexus.loom/pkg/tools"
 )
 
+// DefaultMaxOutputTokens is the per-response output cap used when neither the
+// task spec, --max-output-tokens nor LOOM_MAX_OUTPUT_TOKENS sets one.
+const DefaultMaxOutputTokens = 8192
+
 // StopReason represents the canonical Loom v0.1 Invariant I1 stop reason kinds.
 type StopReason string
 
@@ -182,7 +186,7 @@ func (p *OllamaProvider) Chat(ctx context.Context, prefix compact.PrefixHeader, 
 		}
 	}
 	if maxTokens <= 0 {
-		maxTokens = 2048
+		maxTokens = DefaultMaxOutputTokens
 	}
 
 	var wireMsgs []map[string]any
@@ -331,7 +335,7 @@ func (p *OpenAIProvider) Chat(ctx context.Context, prefix compact.PrefixHeader, 
 		}
 	}
 	if maxTokens <= 0 {
-		maxTokens = 2048
+		maxTokens = DefaultMaxOutputTokens
 	}
 
 	var wireMsgs []map[string]any
@@ -489,7 +493,7 @@ func (p *AnthropicProvider) Chat(ctx context.Context, prefix compact.PrefixHeade
 		return Response{}, fmt.Errorf("ANTHROPIC_API_KEY (or NEXUS_ANTHROPIC_API_KEY) is not set in the environment (or the optional Nexus token file ~/.config/nexus/tokens.env)")
 	}
 	if maxTokens <= 0 {
-		maxTokens = 2048
+		maxTokens = DefaultMaxOutputTokens
 	}
 
 	systemBlocks := []map[string]any{
@@ -803,7 +807,7 @@ func doGeminiGenerateContent(
 	maxTokens int,
 ) (Response, error) {
 	if maxTokens <= 0 {
-		maxTokens = 2048
+		maxTokens = DefaultMaxOutputTokens
 	}
 
 	var contents []map[string]any

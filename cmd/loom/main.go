@@ -54,6 +54,8 @@ Core flags:
   --max-turns N        maximum agent turns (default 8)
   --allow-cmd "cmd.."  allowlisted command prefix (repeatable)
   --max-total-tokens N, --deadline 90s, --max-tool-calls N   budgets (0 = unlimited)
+  --max-output-tokens N per-response output cap (flag > spec > LOOM_MAX_OUTPUT_TOKENS > 8192)
+  --pass-env NAME[,NAME|PREFIX*]  extra env for run_command children (repeatable; secret names only by exact match)
   --trace file         JSONL trace path
   --json               emit result as JSON
   --no-agents-md       do not load AGENTS.md into the prompt
@@ -102,10 +104,16 @@ type budgetFlags struct {
 	maxTotalTokens *int
 	deadline       *time.Duration
 	maxToolCalls   *int
+	maxOutput      *int
+	passEnv        *multiStringFlag
 }
 
 func addBudgetFlags(fs *flag.FlagSet) budgetFlags {
+	var passEnv multiStringFlag
+	fs.Var(&passEnv, "pass-env", "extra env var(s) for run_command children: NAME[,NAME|PREFIX*] (repeatable; secrets only by exact name)")
 	return budgetFlags{
+		passEnv:        &passEnv,
+		maxOutput:      fs.Int("max-output-tokens", 0, "per-response output token cap (0 = spec, then LOOM_MAX_OUTPUT_TOKENS, then 8192)"),
 		maxTotalTokens: fs.Int("max-total-tokens", 0, "cumulative prompt+completion token budget (0 = unlimited)"),
 		deadline:       fs.Duration("deadline", 0, "wall-clock deadline for the run, e.g. 90s (0 = none)"),
 		maxToolCalls:   fs.Int("max-tool-calls", 0, "reject a model turn returning more tool calls than this (0 = unlimited)"),
@@ -122,6 +130,51 @@ func (b budgetFlags) apply(spec *engine.TaskSpec) {
 	}
 	if *b.maxToolCalls > 0 {
 		spec.Constraints.MaxToolCallsPerTurn = *b.maxToolCalls
+	}
+	if *b.maxOutput > 0 {
+		spec.Constraints.MaxOutputTokens = *b.maxOutput
+	}
+	for _, raw := range *b.passEnv {
+		for _, name := range strings.Split(raw, ",") {
+			name = strings.TrimSpace(name)
+			if name != "" && !containsStr(spec.Constraints.PassEnv, name) {
+				spec.Constraints.PassEnv = append(spec.Constraints.PassEnv, name)
+			}
+		}
+	}
+}
+
+func containsStr(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+// parseAllowCmds turns repeated --allow-cmd values into command prefixes.
+func parseAllowCmds(raw []string) engine.AllowCommandList {
+	var out engine.AllowCommandList
+	for _, r := range raw {
+		if fields := strings.Fields(r); len(fields) > 0 {
+			out = append(out, fields)
+		}
+	}
+	return out
+}
+
+// applyPolicyExtras copies spec-level policy knobs onto the policy config and
+// warns on stderr when a secret-looking env name is explicitly passed through.
+func applyPolicyExtras(spec engine.TaskSpec, pol *policy.PolicyConfig) {
+	if len(spec.Constraints.AllowCommands) > 0 {
+		pol.AllowCommands = policy.EffectiveAllowCommands([][]string(spec.Constraints.AllowCommands))
+	}
+	pol.PassEnv = spec.Constraints.PassEnv
+	for _, name := range pol.PassEnv {
+		if policy.IsSecretEnvName(name) {
+			fmt.Fprintf(os.Stderr, "loom warning: --pass-env exposes secret-looking variable %s to run_command children\n", name)
+		}
 	}
 }
 
@@ -227,6 +280,8 @@ func runSubcommand(args []string) int {
 	phiFlag := fs.Bool("phi", false, "enforce PHI local-only model confinement")
 	jsonFlag := fs.Bool("json", false, "emit TaskResult as JSON")
 	bf := addBudgetFlags(fs)
+	var allowCmds multiStringFlag
+	fs.Var(&allowCmds, "allow-cmd", "allowlisted command prefix, unioned with task.json constraints.allow_commands (repeatable)")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -252,6 +307,7 @@ func runSubcommand(args []string) int {
 		spec.Agent = *agent
 	}
 	bf.apply(&spec)
+	spec.Constraints.AllowCommands = append(spec.Constraints.AllowCommands, parseAllowCmds(allowCmds)...)
 
 	return executeSpec(spec, *workspace, *providerName, *modelName, *tracePath, *phiFlag, *noAgentsMD, *stmFlag, *noSTM, *jsonFlag)
 }
@@ -286,13 +342,7 @@ func runPromptMode(args []string) int {
 		return policy.ExitHarnessErr
 	}
 
-	var parsedAllow engine.AllowCommandList
-	for _, raw := range allowCmds {
-		fields := strings.Fields(raw)
-		if len(fields) > 0 {
-			parsedAllow = append(parsedAllow, fields)
-		}
-	}
+	parsedAllow := parseAllowCmds(allowCmds)
 
 	spec := engine.TaskSpec{
 		SchemaVersion:    1,
@@ -318,10 +368,7 @@ func executeSpec(spec engine.TaskSpec, workspace, providerName, modelName, trace
 	pol := policy.DefaultPolicyConfig(workspace)
 	pol.PHIMode = phiFlag || strings.EqualFold(os.Getenv("NEXUS_SENSITIVITY"), "phi")
 
-	if len(spec.Constraints.AllowCommands) > 0 {
-		taskCmds := [][]string(spec.Constraints.AllowCommands)
-		pol.AllowCommands = policy.EffectiveAllowCommands(taskCmds)
-	}
+	applyPolicyExtras(spec, pol)
 
 	// Auto-load AGENTS.md into frozen PrefixHeader.RepoSummary (Invariant I2)
 	if !noAgentsMD && os.Getenv("NEXUS_NO_AGENTS_MD") != "1" && strings.TrimSpace(spec.RepoSummary) == "" {
@@ -445,7 +492,7 @@ func runResume(args []string) int {
 		rest = fs.Args()[1:]
 	}
 	if len(pos) != 1 {
-		fmt.Fprintln(os.Stderr, "usage: loom resume <trace-file> [--max-total-tokens N] [--deadline D] [--max-tool-calls N]")
+		fmt.Fprintln(os.Stderr, "usage: loom resume <trace-file> [--max-total-tokens N] [--deadline D] [--max-tool-calls N] [--max-output-tokens N] [--pass-env NAME]")
 		return policy.ExitHarnessErr
 	}
 	raw, err := os.ReadFile(ckptPath(pos[0]))
@@ -464,10 +511,7 @@ func runResume(args []string) int {
 
 	pol := policy.DefaultPolicyConfig(cf.Meta.Workspace)
 	pol.PHIMode = cf.Meta.PHI
-	if len(spec.Constraints.AllowCommands) > 0 {
-		taskCmds := [][]string(spec.Constraints.AllowCommands)
-		pol.AllowCommands = policy.EffectiveAllowCommands(taskCmds)
-	}
+	applyPolicyExtras(spec, pol)
 	prov, err := buildProvider(cf.Meta.Provider, cf.Meta.Model, pol.PHIMode)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "loom provider error: %v\n", err)

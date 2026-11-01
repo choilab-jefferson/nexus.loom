@@ -49,11 +49,14 @@ type TaskConstraints struct {
 	DeadlineMs int `json:"deadline_ms"`
 	// MaxTotalTokens caps cumulative prompt+completion tokens (0 = unlimited).
 	MaxTotalTokens int `json:"max_total_tokens,omitempty"`
-	// MaxOutputTokens caps tokens per model response (0 = LOOM_MAX_OUTPUT_TOKENS or 2048).
+	// MaxOutputTokens caps tokens per model response (0 = LOOM_MAX_OUTPUT_TOKENS or providers.DefaultMaxOutputTokens).
 	MaxOutputTokens int `json:"max_output_tokens,omitempty"`
 	// MaxToolCallsPerTurn rejects a model turn returning more tool calls (0 = unlimited).
 	MaxToolCallsPerTurn int              `json:"max_tool_calls_per_turn,omitempty"`
 	AllowCommands       AllowCommandList `json:"allow_commands"`
+	// PassEnv extends the run_command env allowlist (names or PREFIX* patterns).
+	// Secret-looking names pass only when listed exactly.
+	PassEnv []string `json:"pass_env,omitempty"`
 }
 
 // TaskSpec represents a Loom v5.1 §5.2 task specification.
@@ -291,6 +294,12 @@ func runTask(ctx context.Context, spec TaskSpec, pol *policy.PolicyConfig, prov 
 		"cloud_eligible":     spec.CloudEligible,
 	})
 
+	for _, name := range spec.Constraints.PassEnv {
+		if policy.IsSecretEnvName(name) {
+			_ = traceWriter.Emit(map[string]any{"t": "env_secret_passed", "run_id": st.runID, "name": name})
+		}
+	}
+
 	initialPrompt := buildInitialUserPrompt(spec)
 	msgs := []compact.Message{
 		{Role: "user", Content: initialPrompt},
@@ -486,7 +495,7 @@ func runTask(ctx context.Context, spec TaskSpec, pol *policy.PolicyConfig, prov 
 			return TaskResult{
 				ExitCode:    policy.ExitTaskFail,
 				Status:      "max_tokens",
-				Output:      resp.Content,
+				Output:      strings.TrimRight(resp.Content, "\n") + fmt.Sprintf(maxTokensHint, maxOutput),
 				Turns:       turn,
 				PrefixHash:  frozenHash,
 				Compactions: compactions,
@@ -523,12 +532,18 @@ func runTask(ctx context.Context, spec TaskSpec, pol *policy.PolicyConfig, prov 
 			if ctx.Err() != nil {
 				return ctxResult(ctx, st, turn, frozenHash, compactions)
 			}
-			_ = traceWriter.Emit(map[string]any{
+			callEv := map[string]any{
 				"t":         "tool_call",
 				"name":      tc.Name,
 				"kind":      "builtin",
 				"args_hash": trace.HashArgs(tc.Arguments),
-			})
+			}
+			if tc.Name == "run_command" {
+				if argv, ok := trace.RedactArgv(tc.Arguments); ok {
+					callEv["argv"] = argv
+				}
+			}
+			_ = traceWriter.Emit(callEv)
 
 			// §6.1: If a tool failed with tool_unavailable >= 2 times consecutively, short-circuit
 			if disabledTools[tc.Name] >= 2 {
@@ -605,15 +620,27 @@ func runTask(ctx context.Context, spec TaskSpec, pol *policy.PolicyConfig, prov 
 				})
 			} else {
 				delete(disabledTools, tc.Name)
-				_ = traceWriter.Emit(map[string]any{
+				ev := map[string]any{
 					"t":            "tool_result",
 					"name":         tc.Name,
 					"bytes_raw":    res.BytesRaw,
 					"bytes_passed": res.BytesPassed,
 					"truncated":    res.Truncated,
-				})
+				}
+				if res.ExitCode != nil {
+					ev["exit_code"] = *res.ExitCode
+					ev["timed_out"] = res.TimedOut
+				}
+				_ = traceWriter.Emit(ev)
 			}
 
+			if res.ViolationKind != "" {
+				_ = traceWriter.Emit(map[string]any{
+					"t":    "policy_violation_recovered",
+					"kind": res.ViolationKind,
+					"tool": tc.Name,
+				})
+			}
 			if res.IsError {
 				lastError = res.Output
 				toolStrikes++
@@ -681,8 +708,11 @@ func buildInitialUserPrompt(spec TaskSpec) string {
 	return b.String()
 }
 
+const maxTokensHint = "\n[loom: response truncated at max_output_tokens=%d; raise --max-output-tokens or LOOM_MAX_OUTPUT_TOKENS, or prefer smaller edits]"
+
 // resolveMaxOutputTokens picks the per-response output cap: task spec, then
-// LOOM_MAX_OUTPUT_TOKENS, then 2048.
+// LOOM_MAX_OUTPUT_TOKENS, then providers.DefaultMaxOutputTokens. (The CLI flag
+// is overlaid onto the spec before this runs, so flag > spec > env > default.)
 func resolveMaxOutputTokens(fromSpec int) int {
 	if fromSpec > 0 {
 		return fromSpec
@@ -690,5 +720,5 @@ func resolveMaxOutputTokens(fromSpec int) int {
 	if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv("LOOM_MAX_OUTPUT_TOKENS"))); err == nil && v > 0 {
 		return v
 	}
-	return 2048
+	return providers.DefaultMaxOutputTokens
 }

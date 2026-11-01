@@ -82,13 +82,14 @@ One JSON object per line, file mode 0600, append-only. `pkg/trace/trace.go` (`Em
 | `run_start` | `run_id`, `task_id`, `agent`, `daemon`, `frozen_prefix_hash`, `cloud_eligible` |
 | `turn_start` | `turn`, `prompt_tokens`, `compacted_this_turn`, `frozen_prefix_hash`, `rendered_prefix_hash` |
 | `stop` | `reason`, `raw_reason`, `provider`, `prompt_eval_count`, `prompt_tokens`, `output_tokens` |
-| `tool_call` | `name`, `kind`, `args_hash` |
-| `tool_result` | `name`, `status` + `consecutive` (tool unavailable) or `bytes_raw`, `bytes_passed`, `truncated` |
+| `tool_call` | `name`, `kind`, `args_hash`; `run_command` additionally `argv` (array of strings, redacted: secret-named `KEY=value` and `--token`/`--password`/`--api-key`-style flag values (`--f x` or `--f=x`) become `***`, `Bearer <tok>` becomes `Bearer ***`; capped at 64 elements, 256 bytes each, ~4 KiB total, a final `...[truncated]` element marks a cut; `args_hash` is still over the unredacted args) |
+| `tool_result` | `name`, `status` + `consecutive` (tool unavailable) or `bytes_raw`, `bytes_passed`, `truncated`; `run_command` additionally `exit_code` (int; `-1` = killed by signal/timeout or not started), `timed_out` (bool) |
+| `policy_violation_recovered` | `kind` (`allowlist` \| `eval_flag`), `tool`. Non-allowlisted argv0, shell wrapper or interpreter eval flag: returned to the model as a tool error and counted toward the tool-error strike limit (`tool_error_strikes`). Path escape, symlink write and PHI cloud refusal stay fatal (`policy_violation`, exit 2). |
 | `escalation_required` | `reason`, `attempts`, `cloud_eligible` |
 | `checkpoint` | `turn`, `run_id` |
 | `done` | `status`, `exit_code`, `turns`, `wall_ms`, `run_id`, `usage`, optional `reason`, `error` |
 
-Exactly one `done` event is written on every exit path. Argument values are never traced, only `args_hash`.
+Exactly one `done` event is written on every exit path. Argument values are never traced, only `args_hash` (exception: redacted `argv` of `run_command`).
 
 ## 5. Snapshot publish procedure (loom#15)
 
@@ -103,3 +104,14 @@ commit plus a tag, published by the owner:
 5. The owner pushes the branch and tag to the public remote and uploads the binaries to the release.
 
 Tagging and release are an owner decision and are not automated here.
+
+## Tool output truncation and run_command result
+
+- Tool output over `max_output_bytes` keeps ~1/3 head and ~2/3 tail (UTF-8 safe) joined by `\n[loom:truncated K bytes in middle]\n`; `bytes_passed` counts head+tail only. `run_command` buffers 1 MiB the same way (head + ring tail), so the end of long output survives.
+- `run_command` results carry structured `exit_code`, `timed_out` and `truncated` (also in the `tool_result` trace event, additive keys). On timeout `timed_out=true` and `exit_code=-1`. The text `[exit_error: ...]` suffix remains for the model.
+
+## Operator flags: env, output cap, allow-cmd (additive)
+
+- `--pass-env NAME[,NAME|PREFIX*]` (repeatable; `run`, prompt mode, `resume`) and `constraints.pass_env` extend the `run_command` child env allowlist. Defaults now include `PYTHONPATH`, `PYTHONUNBUFFERED`, `PYTHONHASHSEED`, `CUDA_VISIBLE_DEVICES`, `CUDA_HOME`, `CUDA_*`, `HF_HOME`, `HF_HUB_CACHE`, `HF_DATASETS_CACHE`, `TRANSFORMERS_CACHE`, `OMP_NUM_THREADS`. Secret-looking names (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*_API_KEY`, ...; `policy.IsSecretEnvName`) are never matched by a prefix; only an exact name passes one, with a stderr warning and an `env_secret_passed` trace event (`name`).
+- `--max-output-tokens N` (`run`, prompt mode, `resume`): precedence flag > `constraints.max_output_tokens` > env `LOOM_MAX_OUTPUT_TOKENS` > default 8192 (was 2048). On a `max_tokens` stop, status/exit are unchanged and `output` ends with a hint naming `--max-output-tokens` / `LOOM_MAX_OUTPUT_TOKENS`. No automatic retry.
+- `loom run --allow-cmd "<prefix>"` (repeatable) is a UNION with `constraints.allow_commands`; the union is then intersected with the global/agent layers (`LOOM_GLOBAL_ALLOW_COMMANDS`, `LOOM_AGENT_ALLOW_COMMANDS`) as in prompt mode. Without the flag, behavior is unchanged.
