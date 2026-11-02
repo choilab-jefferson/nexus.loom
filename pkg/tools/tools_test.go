@@ -376,3 +376,21 @@ func TestScrubEnvMLDefaultsAndPassEnv(t *testing.T) {
 		t.Error("exact HF_TOKEN should pass")
 	}
 }
+
+func TestClampRunTimeout(t *testing.T) {
+	cfg := policy.DefaultPolicyConfig(t.TempDir())
+	if got := clampRunTimeout(999999, cfg); got != 300 {
+		t.Errorf("default clamp = %d, want 300", got)
+	}
+	cfg.MaxCmdTimeoutSec = 600
+	if got := clampRunTimeout(999999, cfg); got != 600 {
+		t.Errorf("raised clamp = %d, want 600", got)
+	}
+	if got := clampRunTimeout(45, cfg); got != 45 {
+		t.Errorf("below clamp = %d, want 45", got)
+	}
+	cfg.MaxCmdTimeoutSec = 0
+	if got := clampRunTimeout(999999, cfg); got != 300 {
+		t.Errorf("zero falls back to 300, got %d", got)
+	}
+}

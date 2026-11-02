@@ -41,13 +41,14 @@ Built by `capabilitiesMap()` (`cmd/loom/main.go:160`). Always a JSON object.
 | `version` | string | Same ldflags value as `loom version` (`cmd/loom/version.go:11`); `"dev"` when unstamped |
 | `commit` | string | Same ldflags value as `loom version`; `"unknown"` when unstamped |
 | `harness` | string | `"loom"` |
-| `subcommands` | array | `run`, `resume`, `capabilities`, `models`, `stm`, `version` (additive) |
+| `context_continuation` | object | `schema` (`loom.context.v1`), `flags`, `task_keys`, `stdio`, `broken_rule`. Present from v0.2.3. |
+| `subcommands` | array | `run`, `resume`, `capabilities`, `models`, `version` (additive) |
 | `default_models` | object | provider -> default model id (additive); `LOOM_MODEL` / `--model` override |
 | `spec_version` | string | `"0.1"` |
 | `invariants` | string[] | `I1`..`I4` |
 | `builtin_tools` | string[] | Built-in tool names |
-| `providers` | string[] | Accepted `--provider` values |
-| `stm_integration`, `agents_md_autoload` | bool | |
+| `providers` | string[] | Accepted `--provider` values (`mock2` = a second mock for cross-provider tests) |
+| `agents_md_autoload` | bool | |
 | `exit_codes` | object | name -> int, table above |
 
 Pinned by `cmd/loom/capabilities_test.go`.
@@ -69,6 +70,9 @@ when `--json`). Exit code of the process equals `exit_code`.
 | `escalation` | object, optional | `EscalationPayload`; present when `exit_code` is 3 |
 | `run_id` | string, optional | |
 | `usage` | object | `prompt_tokens`, `completion_tokens`, `total_tokens` (ints), `pkg/engine/engine.go:134` |
+| `user_turn` | int | 1-based user-turn index of this call within its context (1 for a fresh run). Additive. |
+| `cumulative_usage` | object | Same shape as `usage`: prior user turns from `--context-in` plus this call. `usage` is THIS call only; budgets (`--max-total-tokens`, deadline, tool calls) apply per call. Additive. |
+| `context_path` | string, optional | The `--context-out` file, when one was written (not set for `-`). |
 | `files_changed` | object | `added`, `modified`, `deleted` (sorted, workspace-relative, slash paths; always arrays, empty when nothing changed) and `truncated` (bool). Additive; `schema_version` stays 1. See below. |
 
 `files_changed`: computed by snapshotting path+size+mtime+mode of regular files and symlinks in the workspace at first start and at the end (`.git` skipped; symlinks are recorded themselves, never followed). A size/mtime/mode change = `modified`. Total entries across the three lists are capped at 1000, and the snapshot walk at 20000 files; `truncated` is true when either cap hit. The baseline is stored in the checkpoint (`<trace>.ckpt`, `checkpoint.baseline`), so `loom resume` reports changes since the original start. Old checkpoints without a baseline still resume; their baseline is a snapshot taken at resume time (earlier changes are not reported). Loom's own files are excluded when they resolve inside the workspace: the `--trace` file, `<trace>.ckpt`, `<trace>.lock`, and checkpoint temp files (`.ckpt-*`) in the trace directory.
@@ -113,6 +117,69 @@ Usage: `prompt_tokens`/`output_tokens` are provider-reported. The sum of per-tur
 
 Exactly one `done` event is written on every exit path. Argument values are never traced, only `args_hash` (exception: redacted `argv` of `run_command`).
 
+## Conversation context (`loom.context.v1`)
+
+One loom call is one user turn: the prompt, all model turns and tool calls, up to the point the agent
+would wait for the next prompt. The next prompt is the next call. The conversation is an explicit,
+caller-editable JSON document, independent of the trace/checkpoint (those only serve `loom resume`).
+
+- `--context-out <path|->` (spec `context_out`): after the run, write the updated context. `-` = stdout;
+  then stdout holds ONLY the context and the result/`--json`/escalation output goes to stderr. A file is written
+  atomically with mode 0600 and named in `TaskResult.context_path`. Written for every outcome that reached the
+  engine (success or not), so a caller can continue after exit 1/3/4.
+- `--context-in <path|->` (spec `context_in`; flags override spec): load a prior context (`-` = stdin), append the
+  new `-p` instruction as the next user message, run one bounded turn-sequence. System prompt, tool schemas and
+  AGENTS.md are NOT part of the context (they come from the current run, so a context moves between providers/models).
+  `pkg/compact` runs on the whole history every call; folded tool results (`[loom:folded ...]`) are the persisted
+  compaction summaries.
+
+```json
+{
+  "schema_version": "loom.context.v1",
+  "user_turn": 2,
+  "messages": [
+    {"role": "user", "content": "..."},
+    {"role": "assistant", "content": "...", "tool_calls": [{"id": "c1", "name": "write_file", "arguments": {}}]},
+    {"role": "tool", "tool_call_id": "c1", "tool_name": "write_file", "content": "..."}
+  ],
+  "runs": [{"run_index": 1, "run_id": "...", "status": "success", "exit_code": 0, "turns": 2,
+            "usage": {}, "files_changed": {"added": [], "modified": [], "deleted": [], "truncated": false}}],
+  "cumulative_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+  "compactions": 0
+}
+```
+
+`messages[].role` is `user`, `assistant` or `tool`; other keys follow `compact.Message` (`name`, `tool_name`,
+`tool_call_id`, `tool_calls[]` with `id`, `name`, `arguments`, optional `thought_signature`). `runs[]` holds one
+record per user turn; `files_changed` there is that turn's delta (its baseline is the workspace at the start of the turn).
+Consumers must ignore unknown keys.
+
+### Validation and the broken-structure rule
+
+Exit 2 with one diagnostic line on stderr (`loom context error: ...`): unreadable file, invalid JSON, missing or
+unknown `schema_version`, unknown message role. Everything else is repaired deterministically, one stderr line per
+repair (`loom context repair: ...`), before the history reaches any provider:
+
+1. A `tool_call` with no `tool_result` directly after its assistant message is dropped; an assistant message left with
+   neither text nor calls is dropped.
+2. A `tool_result` that matches no call of the directly preceding assistant message (orphan, duplicate, or
+   out of position) is dropped.
+3. Adjacent plain messages of the same role merge with a blank line (roles alternate; caller notes join the new prompt).
+
+Rendering (Anthropic `tool_use`/`tool_result` pairing and merged result turns, Gemini `model`/`user` roles and
+`functionResponse`, OpenAI `tool` messages) is loom's job; the caller never writes provider shapes.
+
+### Pipelines
+
+```sh
+loom -p "turn 1" --context-out - | loom -p "turn 2" --context-in - --context-out - > ctx.json
+```
+
+`loom resume <trace>` (interrupted run) is unchanged and uses the internal checkpoint; a context-continued run keeps
+its prior totals through resume and writes its `--context-out` when it finishes. Two conversations are independent when
+they use distinct `--workspace`, `--trace` and context files (run locks as above). `--provider mock2` is a built-in alias
+of `mock` that reports itself as `mock2`, for cross-provider continuation tests.
+
 ## 5. Snapshot publish procedure (loom#15)
 
 Documentation only; no script in this repo pushes anything. The public snapshot is a squashed single
@@ -135,6 +202,7 @@ Tagging and release are an owner decision and are not automated here.
 ## Operator flags: env, output cap, allow-cmd (additive)
 
 - `--pass-env NAME[,NAME|PREFIX*]` (repeatable; `run`, prompt mode, `resume`) and `constraints.pass_env` extend the `run_command` child env allowlist. Defaults now include `PYTHONPATH`, `PYTHONUNBUFFERED`, `PYTHONHASHSEED`, `CUDA_VISIBLE_DEVICES`, `CUDA_HOME`, `CUDA_*`, `HF_HOME`, `HF_HUB_CACHE`, `HF_DATASETS_CACHE`, `TRANSFORMERS_CACHE`, `OMP_NUM_THREADS`. Secret-looking names (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*_API_KEY`, ...; `policy.IsSecretEnvName`) are never matched by a prefix; only an exact name passes one, with a stderr warning and an `env_secret_passed` trace event (`name`).
+- `--max-cmd-timeout S` (`run`, prompt mode, `resume`): upper clamp for `run_command` `timeout_s` (default 300). Accepts integer seconds or a duration (`10m`). Precedence flag > `constraints.max_cmd_timeout_sec` > env `LOOM_MAX_CMD_TIMEOUT` > 300. `make build` stamps `main.version`/`main.commit` from `git describe`/`git rev-parse` via ldflags (`loom --version`).
 - `--max-output-tokens N` (`run`, prompt mode, `resume`): precedence flag > `constraints.max_output_tokens` > env `LOOM_MAX_OUTPUT_TOKENS` > default 8192 (was 2048). On a `max_tokens` stop, status/exit are unchanged and `output` ends with a hint naming `--max-output-tokens` / `LOOM_MAX_OUTPUT_TOKENS`. No automatic retry.
 - `loom run --allow-cmd "<prefix>"` (repeatable) is a UNION with `constraints.allow_commands`; the union is then intersected with the global/agent layers (`LOOM_GLOBAL_ALLOW_COMMANDS`, `LOOM_AGENT_ALLOW_COMMANDS`) as in prompt mode. Without the flag, behavior is unchanged.
 

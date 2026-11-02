@@ -20,8 +20,7 @@ func TestMain(m *testing.M) {
 	}
 	os.Setenv("HOME", tmp)
 	os.Setenv("NEXUS_CONFIG_HOME", tmp)
-	os.Setenv("NEXUS_STM_DIR", tmp)
-	for _, k := range []string{"NEXUS_PROJECT_ID", "NEXUS_SENSITIVITY", "NEXUS_STM_INJECT", "NEXUS_NO_AGENTS_MD"} {
+	for _, k := range []string{"NEXUS_SENSITIVITY", "LOOM_NO_AGENTS_MD"} {
 		os.Unsetenv(k)
 	}
 	code := m.Run()

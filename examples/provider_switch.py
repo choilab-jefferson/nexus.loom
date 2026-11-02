@@ -22,7 +22,7 @@ MODELS = {"anthropic": "claude-haiku-5-5", "gemini": "gemini-3.8-flash"}  # chea
 def run(provider, prompt, ws):
     """One loom run; return (ok, text, tokens)."""
     cmd = [LOOM, "-p", prompt, "--provider", provider, "--workspace", ws, "--json",
-           "--no-agents-md", "--no-stm", "--max-turns", "2", "--max-total-tokens", "6000"]
+           "--no-agents-md", "--max-turns", "2", "--max-total-tokens", "6000"]
     if provider in MODELS:
         cmd += ["--model", MODELS[provider]]
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)

@@ -11,5 +11,5 @@ python3 examples/provider_switch.py                  # anthropic + gemini; falls
 python3 examples/provider_switch.py --mock           # no network, no keys
 ```
 
-Runs use an empty temp workspace with `--no-agents-md --no-stm`, `--max-turns 2` and a small token budget.
+Runs use an empty temp workspace with `--no-agents-md`, `--max-turns 2` and a small token budget.
 The mock provider always replies `mock task complete`.

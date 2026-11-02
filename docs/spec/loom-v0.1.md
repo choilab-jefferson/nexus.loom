@@ -1,7 +1,7 @@
 # Loom v0.1 — Technical Specification for the Nexus Local & Direct-API Leaf Execution Harness
 
 > Status: Implemented in Go 1.22+ (`nexus.loom`, zero external module dependencies).
-> Scope: Single-binary in-process leaf execution harness (`cmd/loom`, `pkg/{policy,compact,tools,providers,stm,engine,trace}`). No resident `loomd` daemon.
+> Scope: Single-binary in-process leaf execution harness (`cmd/loom`, `pkg/{policy,compact,tools,providers,engine,trace}`). No resident `loomd` daemon.
 
 ---
 
@@ -12,7 +12,7 @@ Loom v0.1 is the Nexus in-house, zero-dependency Go leaf execution harness desig
 1. **Single Static Go Binary (`CGO_ENABLED=0`)**: Eliminates Python/Node CLI boot overhead and external MCP subprocess cold start by embedding first-order filesystem, search, and command execution tools directly in-process.
 2. **No Resident Sidecar (`loomd` Omitted)**: All tools execute in-process with sub-millisecond startup. Model KV-cache residency is delegated to the serving engine (`keep_alive: -1` on Ollama; ephemeral prompt caching on Anthropic) paired with strict prefix immutability (Invariant I2).
 3. **Dual Model Transport + Nexus Token Store Integration**: Supports local open-weight models via Ollama alongside direct HTTP API clients (`openai`, `anthropic`/`anthropic-api`, `gemini`/`gemini-api`, `google-agent-platform`/`vertex`, `typesafe`/`jev`) and a deterministic `mock` replay provider. Call-time API keys are resolved directly from `$NEXUS_CONFIG_HOME/tokens.env` (`~/.config/nexus/tokens.env`) and scrubbed from all child processes spawned via `run_command`. Under `PHIMode`, cloud and non-local endpoints are hard-blocked at the policy layer.
-4. **Automatic `AGENTS.md` Prefix Freezing & Nexus STM Injection (`pkg/stm`)**: Automatically discovers `AGENTS.md` (walking up from worktrees/submodules) to populate `PrefixHeader.RepoSummary` (Invariant I2), and injects the live Nexus System STM brief (`~/.local/share/nexus/stm/stm-<pid>`) into the initial user turn inside a `<nexus_stm>` safety fence without invalidating the frozen prefix cache.
+4. **Automatic `AGENTS.md` Prefix Freezing (`pkg/engine`)**: Automatically discovers `AGENTS.md` (walking up from worktrees/submodules) to populate `PrefixHeader.RepoSummary` (Invariant I2). Context is host-managed: the host passes it via the prompt, `task_slice.context_files`, or `--context-in`/`--context-out`; loom reads no Nexus STM.
 
 ---
 
@@ -21,7 +21,7 @@ Loom v0.1 is the Nexus in-house, zero-dependency Go leaf execution harness desig
 | Invariant | Name | Rule & Enforcement |
 |---|---|---|
 | **I1** | Bounded Single-Agent Leaf Loop & `StopReason` Normalization | Loom is strictly a leaf executor (`max_turns` bounded, no recursive sub-agent dispatch tool). Provider stop strings are normalized to 5 canonical kinds (`end_turn`, `tool_use`, `max_tokens`, `error`, `unknown`). If `len(ToolCalls) > 0`, `StopToolUse` is forced regardless of raw vendor `finish_reason`. `StopUnknown` retries once, then exits `2` if persistent. |
-| **I2** | Prefix Immutability | `PrefixHeader` (`SystemPrompt` + canonical sorted `ToolSchemasJSON` + `RepoSummary` from `AGENTS.md`) is frozen at run start. Its SHA-256 digest (`PrefixHash()`) is verified before every turn and logged in JSONL traces (`frozen_prefix_hash`, `rendered_prefix_hash`). Volatile state such as Nexus STM is placed in the initial user turn, never the system prefix. Any mid-run mutation exits `2`. |
+| **I2** | Prefix Immutability | `PrefixHeader` (`SystemPrompt` + canonical sorted `ToolSchemasJSON` + `RepoSummary` from `AGENTS.md`) is frozen at run start. Its SHA-256 digest (`PrefixHash()`) is verified before every turn and logged in JSONL traces (`frozen_prefix_hash`, `rendered_prefix_hash`). Volatile state such as host-supplied context is placed in the initial user turn, never the system prefix. Any mid-run mutation exits `2`. |
 | **I3** | Prefix-Preserving Pre-Send Compaction | Before every `Provider.Chat` call, `CompactMessages` estimates total context tokens (`max(1, len(s)/4)`). When tokens exceed `maxContextTokens`, older `tool` messages outside the `keepRecent` window are deterministically folded into `[loom:folded turn=N sha256=... bytes=... lines=... preview=...]` while preserving `PrefixHeader`, the initial user task prompt, and salient test/linter error lines (`FAIL`, `ERROR`, `AssertionError`, `panic`). |
 | **I4** | Capability Intersection & Workspace Confinement | Every file operation resolves symlinks (`ResolveScopedPath` via `filepath.EvalSymlinks` walk) and blocks paths escaping `Workspace` or matching `DenyGlobs` (`.git/**`, `.env*`). Command execution (`run_command`) forbids shell wrappers (`sh`, `bash`, `zsh`, `eval`, `make`, `npm`, `npx`, `uvx`, `sudo`), passes only an allowlisted child environment (everything else dropped), resolves argv[0] via `exec.LookPath` and rejects workspace binaries, bounds timeout (300s) and output (1 MiB), kills the process group; `run_command` is NOT a sandbox (child keeps the user's filesystem/network access), and validates `argv` token prefixes against `IntersectAllowCommands(global, agent, task)` (global/agent layers from `LOOM_GLOBAL_ALLOW_COMMANDS` / `LOOM_AGENT_ALLOW_COMMANDS`, `;`-separated). Path escape, symlink writes and PHI cloud refusal return `*policy.ViolationError` (Kind `fatal`) and exit immediately with code `2`; command-policy violations (allowlist mismatch, shell wrapper, interpreter eval flag) are recoverable: returned to the model as a tool error (trace `policy_violation_recovered`, counted toward the tool-error strike limit). |
 
@@ -34,7 +34,7 @@ loom/
 ├── go.mod                      # module github.com/choilab-jefferson/nexus.loom (Go 1.22+, zero external dependencies)
 ├── Makefile                    # build, test, clean targets
 ├── .gitlab-ci.yml              # GitLab CI lint (gofmt/go vet) and test/build pipeline
-├── cmd/loom/main.go            # CLI entrypoint (run, -p, stm, capabilities)
+├── cmd/loom/main.go            # CLI entrypoint (run, -p, capabilities)
 └── pkg/
     ├── policy/                 # Invariant I4: symlink scope, allow_commands intersection, argv validation, tokens.env reader
     │   ├── policy.go
@@ -48,9 +48,6 @@ loom/
     ├── providers/              # §5 Ollama, OpenAI, Anthropic, Gemini, GoogleAgentPlatform, TypeSafe, and ScriptedMock providers
     │   ├── providers.go
     │   └── providers_test.go
-    ├── stm/                    # §6 AGENTS.md discovery + Nexus System STM brief loader (<nexus_stm>)
-    │   ├── stm.go
-    │   └── stm_test.go
     ├── trace/                  # §8 JSONL event stream writer
     │   └── trace.go
     └── engine/                 # Bounded leaf execution loop + task.json parser
@@ -71,7 +68,7 @@ All tool schemas are deterministically sorted by name in `CanonicalToolSchemasJS
 | `search` | `pattern`, `path`, `max_matches` | Pure Go `regexp` walk confined to workspace, skipping `.git`, `.worktrees`, `node_modules`, denied globs, and binary files. |
 | `edit_file` | `path`, `target`, `replacement` | Resolves path via `ResolveScopedPath(..., write=true)` and replaces exact `target` with `replacement`. |
 | `write_file` | `path`, `content` | Resolves path via `ResolveScopedPath(..., write=true)`, creates parent directories inside workspace, and writes `content`. |
-| `run_command` | `argv []string`, `timeout_s int` | Validates `argv` via `policy.ValidateCommandArgv` and executes `exec.CommandContext` with `Dir = Workspace` and no shell (`shell=false`). Scrubs call-time API keys (`NEXUS_ANTHROPIC_API_KEY`, `NEXUS_GEMINI_API_KEY`, `NEXUS_GOOGLE_AGENT_API_KEY`, `TYPESAFE_API_KEY`, etc.) from `cmd.Env`. When `filepath.Base(argv[0]) == "ikb"`, injects `IKB_MCP_TOKEN` / `IKB_API_TOKEN` from `~/.config/nexus/tokens.env`. |
+| `run_command` | `argv []string`, `timeout_s int` | `timeout_s` is clamped to `max_cmd_timeout_sec` / `--max-cmd-timeout` / `LOOM_MAX_CMD_TIMEOUT` (default 300). Validates `argv` via `policy.ValidateCommandArgv` and executes `exec.CommandContext` with `Dir = Workspace` and no shell (`shell=false`). Scrubs call-time API keys (`NEXUS_ANTHROPIC_API_KEY`, `NEXUS_GEMINI_API_KEY`, `NEXUS_GOOGLE_AGENT_API_KEY`, `TYPESAFE_API_KEY`, etc.) from `cmd.Env`. When `filepath.Base(argv[0]) == "ikb"`, injects `IKB_MCP_TOKEN` / `IKB_API_TOKEN` from `~/.config/nexus/tokens.env`. |
 | `escalate` | `reason`, `minimal_context`, `attempted []string` | Terminates the run with Exit Code `3` and emits a structured `escalation_required` JSON payload on stdout. |
 
 ---
@@ -97,12 +94,10 @@ Model ids are never validated against a built-in list. A 404 (or a 400 naming an
 
 ---
 
-## 6. `AGENTS.md` & Nexus System STM Integration (`pkg/stm`)
+## 6. `AGENTS.md` Autoload (`pkg/engine`)
 
-1. **`DiscoverAgentsMD(workspace)`**: Walks up to 4 parent directories from `workspace` (covering `.worktrees/worker-*` and git submodules) to read `AGENTS.md` (capped at 12,000 bytes). Unless `--no-agents-md` or `NEXUS_NO_AGENTS_MD=1` is set, this content is placed in `PrefixHeader.RepoSummary` so project rules are part of the immutable cached prefix.
-2. **`ResolveProjectID(workspace)`**: Resolves the 21-char `p<20>` Nexus project ID from `NEXUS_PROJECT_ID`, `.git/nexus/project-id` (including git worktree/submodule `gitdir:` indirection), or `$NEXUS_STM_DIR/stm-w*/node/w*.md`.
-3. **`LoadBrief(workspace, phiClamp)`**: Reads `$NEXUS_STM_DIR/stm-<pid>/node/<pid>.md` and up to 8 active recent nodes (filtering out `invalid_at != null`, sorted by `seq` descending). Under `phiClamp` or when `sensitivity != "standard"`, node summaries and agent fields are redacted.
-4. **User-Turn Fence (`FormatFenced()`, Opt-In Continuity)**: Loom runs as an independent agent by default with its own bounded task context. When continuity with Nexus STM is explicitly requested (`--stm`, `"include_stm": true` in `task.json`, or `NEXUS_STM_INJECT=1`), the fenced `<nexus_stm>` block is appended to the initial user instruction so the frozen system prefix hash (Invariant I2) remains unchanged when STM nodes update.
+1. **`DiscoverAgentsMD(workspace)`**: Walks up from `workspace` to the enclosing git root (covering `.worktrees/worker-*` and git submodules) to read `AGENTS.md` (capped at 12,000 bytes). Unless `--no-agents-md` or `LOOM_NO_AGENTS_MD=1` is set, this content is placed in `PrefixHeader.RepoSummary` so project rules are part of the immutable cached prefix.
+2. **Host-managed context**: loom does not read Nexus STM or project IDs. Continuity context comes from the host via the prompt, `task_slice.context_files`, or `--context-in`/`--context-out`.
 
 ---
 
@@ -114,19 +109,16 @@ Model ids are never validated against a built-in list. A 404 (or a 400 naming an
 # Task-file execution mode
 loom run --agent <name> --task-file <task.json> --workspace <dir> \
   [--provider ollama|openai|anthropic|anthropic-api|gemini|gemini-api|google-agent-platform|typesafe|mock] \
-  [--model <m>] [--trace <jsonl>] [--phi] [--no-agents-md] [--no-stm] [--non-interactive] [--no-daemon] [--json] \
-  [--allow-cmd "pytest"] [--pass-env NAME[,PREFIX*]] [--max-output-tokens N]
+  [--model <m>] [--trace <jsonl>] [--phi] [--no-agents-md] [--non-interactive] [--no-daemon] [--json] \
+  [--allow-cmd "pytest"] [--pass-env NAME[,PREFIX*]] [--max-output-tokens N] [--max-cmd-timeout S]
 # run: --allow-cmd is UNIONed with task.json constraints.allow_commands, then intersected with global/agent layers
 
 # Single-shot prompt mode
 loom -p "<instruction>" [--workspace <dir>] \
   [--provider ollama|openai|anthropic|anthropic-api|gemini|gemini-api|google-agent-platform|typesafe|mock] \
   [--model <m>] [--max-turns 8] [--max-context-tokens 28000] \
-  [--allow-cmd "pytest"] [--pass-env NAME[,PREFIX*]] [--max-output-tokens N] \
-  [--trace <jsonl>] [--phi] [--no-agents-md] [--no-stm] [--json]
-
-# Inspect workspace Nexus STM brief
-loom stm [--workspace <dir>] [--phi] [--json]
+  [--allow-cmd "pytest"] [--pass-env NAME[,PREFIX*]] [--max-output-tokens N] [--max-cmd-timeout S] \
+  [--trace <jsonl>] [--phi] [--no-agents-md] [--json]
 
 # Capability negotiation
 loom capabilities --json

@@ -44,13 +44,34 @@ Run `loom` with no arguments (exit 2) or `loom --help` (exit 0) for the full lis
 | `--workspace` | workspace root; all file access is confined here |
 | `--allow-cmd "git status"` | allow a command prefix for `run_command` (repeatable; none by default). On `loom run` it is unioned with task.json `constraints.allow_commands`, then intersected with global/agent layers |
 | `--pass-env NAME[,NAME\|PREFIX*]` | extra env vars for `run_command` children (repeatable; also `run`/`resume`, spec `constraints.pass_env`). ML defaults (PYTHONPATH, CUDA_*, HF_HOME, ...) pass already; secrets (`*TOKEN*`, `*_API_KEY`, ...) only by exact name, with a warning |
+| `--max-cmd-timeout S` | `run_command` `timeout_s` clamp (default 300): integer seconds or duration like `10m`; flag > `constraints.max_cmd_timeout_sec` > `LOOM_MAX_CMD_TIMEOUT` |
 | `--max-output-tokens N` | per-response output cap (also `run`/`resume`); flag > spec > `LOOM_MAX_OUTPUT_TOKENS` > 8192 |
 | `--max-turns`, `--max-total-tokens`, `--deadline`, `--max-tool-calls` | budgets |
 | `--trace file.jsonl`, `--json` | trace output, machine-readable result |
 | `loom resume <trace>` | continue an interrupted run |
+| `--context-in F` / `--context-out F` | continue a conversation from / write it to a `loom.context.v1` file (`-` = stdin/stdout; spec keys `context_in`/`context_out`) |
 | `loom capabilities --json` | tools and providers as JSON |
 
 Keys: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`/`GOOGLE_API_KEY`, `TYPESAFE_API_KEY`.
+
+## Conversations: one call = one user turn
+
+Each loom call answers one user prompt (any number of model turns and tool calls). The caller owns the
+prompt loop and the history: `--context-out` writes the conversation as `loom.context.v1` JSON, and
+`--context-in` continues from it (the new `-p` prompt is appended). Both accept `-` for stdin/stdout, so
+calls compose in a shell pipeline; the file is plain JSON you may trim, summarise, redact or merge
+between calls, and it works across providers.
+
+```sh
+loom -p "create notes.txt" --provider anthropic --context-out ctx.json
+loom -p "now show what you wrote" --provider gemini --context-in ctx.json --context-out ctx.json
+loom -p "turn 1" --context-out - | loom -p "turn 2" --context-in - --context-out - > ctx.json
+```
+
+With `--context-out -` stdout carries only the context; the result/`--json` output goes to stderr.
+A dangling `tool_call` or orphan `tool_result` is dropped with a note on stderr; invalid JSON or an
+unknown `schema_version` exits 2. `loom resume <trace>` (interrupted run) is unchanged. Format and rules:
+[docs/contract.md](docs/contract.md#conversation-context-loomcontextv1).
 
 ## Models
 
@@ -91,10 +112,9 @@ Many loom processes can run at once (e.g. one per task) if each has its own `--t
 
 Nothing here is needed to use loom. These features only activate when Nexus files exist or when you opt in.
 
-- **AGENTS.md autoload**: `AGENTS.md` found in the workspace or up to 4 parents is loaded into the prompt prefix. Disable with `--no-agents-md` or `NEXUS_NO_AGENTS_MD=1`.
-- **STM brief** (`--stm`, `"include_stm": true` in `task.json`, or `NEXUS_STM_INJECT=1`): injects a short `<nexus_stm>` brief read from `$NEXUS_STM_DIR/stm-<project-id>/node/` into the first user turn. Inspect it with `loom stm --workspace . [--json]`.
-- **STM env**: `NEXUS_STM_DIR` unset uses `~/.local/share/nexus/stm`; set to an empty string it disables STM lookup (nothing is read from the host). Project-id resolution order is `NEXUS_PROJECT_ID`, then `.git/nexus/project-id`, then a fallback scan of `$NEXUS_STM_DIR/stm-w*/node/w*.md` (nexus workspace-entity nodes: `- id: <pid>` followed by `line: <slug>:` where slug is the workspace dir name; first match wins).
-- **`--phi`**: local-only model confinement (non-local endpoints are refused; STM summaries redacted).
+- **AGENTS.md autoload**: `AGENTS.md` found in the workspace or up to 4 parents is loaded into the prompt prefix. Disable with `--no-agents-md` or `LOOM_NO_AGENTS_MD=1`.
+- **Host-managed context**: loom reads no Nexus state. The host passes context via the prompt, `task_slice.context_files`, or `--context-in` / `--context-out`.
+- **`--phi`**: local-only model confinement (non-local endpoints are refused).
 - **Token store**: key lookup order per provider is the standard env var, then the `NEXUS_*` alias (`NEXUS_ANTHROPIC_API_KEY`, `NEXUS_OPENAI_API_KEY`, `NEXUS_GEMINI_API_KEY`, `NEXUS_GOOGLE_AGENT_API_KEY`), then `$NEXUS_CONFIG_HOME/tokens.env` (default `~/.config/nexus/tokens.env`) only if that file exists. `IKB_MCP_TOKEN` from it is injected only into `ikb` subprocesses.
 
 - **google-agent-platform**: the only provider with extra required config: a GCP project via `NEXUS_GCP_PROJECT` (optional `NEXUS_GCP_LOCATION`, default `global`) or a JSON file `{"project","location"}` at `NEXUS_GAP_CREDIT_CONFIG` / `$NEXUS_CONFIG_HOME/google-agent-platform-credit.json`. Without it the provider fails with a clear error; all other providers are independent of nexus.
@@ -114,4 +134,4 @@ MIT, see [LICENSE](LICENSE).
 
 ## Hermetic tests
 
-Packages that can touch Nexus state carry a `hermetic_test.go` `TestMain` that points `HOME`, `NEXUS_CONFIG_HOME` and `NEXUS_STM_DIR` at a temp dir and unsets `NEXUS_PROJECT_ID`, `NEXUS_SENSITIVITY`, `NEXUS_STM_INJECT`, `NEXUS_NO_AGENTS_MD`. Today that is six packages: `pkg/compact`, `pkg/engine`, `pkg/policy`, `pkg/providers`, `pkg/stm`, `pkg/tools`. `cmd/loom` and `pkg/trace` have none because their tests touch no Nexus state; add one when a new package starts reading Nexus env or files.
+Packages that can touch Nexus state carry a `hermetic_test.go` `TestMain` that points `HOME` and `NEXUS_CONFIG_HOME` at a temp dir and unsets `NEXUS_SENSITIVITY`, `LOOM_NO_AGENTS_MD`. Today that is five packages: `pkg/compact`, `pkg/engine`, `pkg/policy`, `pkg/providers`, `pkg/tools`. `cmd/loom` and `pkg/trace` have none because their tests touch no Nexus state; add one when a new package starts reading Nexus env or files.

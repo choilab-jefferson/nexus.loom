@@ -57,6 +57,8 @@ type TaskConstraints struct {
 	// PassEnv extends the run_command env allowlist (names or PREFIX* patterns).
 	// Secret-looking names pass only when listed exactly.
 	PassEnv []string `json:"pass_env,omitempty"`
+	// MaxCmdTimeoutSec raises/lowers the run_command timeout_s clamp (0 = policy default 300).
+	MaxCmdTimeoutSec int `json:"max_cmd_timeout_sec,omitempty"`
 }
 
 // TaskSpec represents a Loom v5.1 §5.2 task specification.
@@ -72,9 +74,12 @@ type TaskSpec struct {
 	TierHint         string          `json:"tier_hint"`
 	CloudEligible    bool            `json:"cloud_eligible"`
 	MaxContextTokens int             `json:"max_context_tokens"`
-	IncludeSTM       bool            `json:"include_stm,omitempty"`
 	SystemPrompt     string          `json:"system_prompt,omitempty"`
 	RepoSummary      string          `json:"repo_summary,omitempty"`
+	// ContextIn / ContextOut are the conversation context paths ("-" = stdin / stdout);
+	// the --context-in / --context-out flags override them (docs/contract.md).
+	ContextIn  string `json:"context_in,omitempty"`
+	ContextOut string `json:"context_out,omitempty"`
 }
 
 // LoadTaskFile parses a task.json file while ignoring unknown fields (§5.3).
@@ -132,6 +137,15 @@ type TaskResult struct {
 	RunID         string             `json:"run_id,omitempty"`
 	Usage         Usage              `json:"usage"`
 	FilesChanged  FilesChanged       `json:"files_changed"`
+	// UserTurn is the 1-based user-turn index of this invocation within its context
+	// (1 for a fresh run). Usage above is THIS invocation only; CumulativeUsage adds all
+	// prior user turns from --context-in. Budgets (max_total_tokens) apply to Usage.
+	UserTurn        int   `json:"user_turn"`
+	CumulativeUsage Usage `json:"cumulative_usage"`
+	// ContextPath is set by the CLI when --context-out names a file.
+	ContextPath string `json:"context_path,omitempty"`
+	// Msgs is the final history of this invocation (not serialized; feeds BuildContext).
+	Msgs []compact.Message `json:"-"`
 }
 
 // Usage is cumulative provider-reported token usage for a run.
@@ -162,6 +176,13 @@ type RunOptions struct {
 	OnCheckpoint func(Checkpoint)
 	// TracePath, when set, excludes loom's own trace/checkpoint files from files_changed.
 	TracePath string
+	// Context is the validated prior conversation (--context-in); its messages precede the
+	// new user prompt and its cumulative usage feeds TaskResult.CumulativeUsage.
+	Context *Context
+	// PriorUsage / PriorUserTurn carry the prior-context totals when Context.Messages is
+	// not available (a resumed run whose checkpoint already holds the messages).
+	PriorUsage    Usage
+	PriorUserTurn int
 }
 
 // runState is mutated by runTask so the RunTaskWithOptions wrapper can emit
@@ -173,6 +194,7 @@ type runState struct {
 	opts   RunOptions
 	// baseline is the workspace snapshot from the first start of the logical run.
 	baseline *Snapshot
+	msgs     []compact.Message
 }
 
 func newRunID() string {
@@ -222,6 +244,13 @@ func RunTaskWithOptions(ctx context.Context, spec TaskSpec, pol *policy.PolicyCo
 	}
 	res.RunID = st.runID
 	res.Usage = st.usage
+	prior, priorTurn := opts.PriorUsage, opts.PriorUserTurn
+	if opts.Context != nil {
+		prior, priorTurn = opts.Context.CumulativeUsage, opts.Context.UserTurn
+	}
+	res.CumulativeUsage = AddUsage(prior, st.usage)
+	res.UserTurn = priorTurn + 1
+	res.Msgs = st.msgs
 	res.FilesChanged = emptyFilesChanged()
 	if pol != nil {
 		res.FilesChanged = DiffSnapshots(st.baseline, TakeSnapshot(pol.Workspace, exclude))
@@ -321,9 +350,12 @@ func runTask(ctx context.Context, spec TaskSpec, pol *policy.PolicyConfig, prov 
 	}
 
 	initialPrompt := buildInitialUserPrompt(spec)
-	msgs := []compact.Message{
-		{Role: "user", Content: initialPrompt},
+	var msgs []compact.Message
+	if st.opts.Context != nil {
+		msgs = append(msgs, st.opts.Context.Messages...)
 	}
+	msgs = appendPlain(msgs, compact.Message{Role: "user", Content: initialPrompt})
+	defer func() { st.msgs = msgs }()
 
 	compactions := 0
 	unknownStopRetries := 0

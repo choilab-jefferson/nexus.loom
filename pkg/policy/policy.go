@@ -92,19 +92,22 @@ type PolicyConfig struct {
 	MaxReadLines   int
 	MaxOutputBytes int
 	PHIMode        bool
+	// MaxCmdTimeoutSec is the upper clamp for run_command timeout_s (0 = 300).
+	MaxCmdTimeoutSec int
 }
 
 // DefaultPolicyConfig returns a baseline policy rooted at workspace.
 func DefaultPolicyConfig(workspace string) *PolicyConfig {
 	return &PolicyConfig{
-		Workspace:      workspace,
-		ReadAllow:      []string{"**"},
-		WriteAllow:     []string{"**"},
-		DenyGlobs:      []string{".git", ".git/**", "**/.git/**", ".env", ".env*", "**/.env*"},
-		AllowCommands:  nil,
-		MaxReadLines:   400,
-		MaxOutputBytes: 16384,
-		PHIMode:        false,
+		Workspace:        workspace,
+		ReadAllow:        []string{"**"},
+		WriteAllow:       []string{"**"},
+		DenyGlobs:        []string{".git", ".git/**", "**/.git/**", ".env", ".env*", "**/.env*"},
+		AllowCommands:    nil,
+		MaxReadLines:     400,
+		MaxOutputBytes:   16384,
+		PHIMode:          false,
+		MaxCmdTimeoutSec: 300,
 	}
 }
 

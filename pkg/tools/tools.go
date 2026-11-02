@@ -612,6 +612,18 @@ func (c *cappedBuffer) String() string {
 	return h[:hb] + truncMarker(dropped) + t[ts:]
 }
 
+// clampRunTimeout caps timeout_s at cfg.MaxCmdTimeoutSec (default maxRunTimeoutSec).
+func clampRunTimeout(sec int, cfg *policy.PolicyConfig) int {
+	limit := maxRunTimeoutSec
+	if cfg != nil && cfg.MaxCmdTimeoutSec > 0 {
+		limit = cfg.MaxCmdTimeoutSec
+	}
+	if sec > limit {
+		return limit
+	}
+	return sec
+}
+
 // execRunCommand runs an allowlisted argv. NOT a sandbox: the child has the
 // harness user's full filesystem/network access; policy only gates argv.
 func execRunCommand(ctx context.Context, args map[string]any, cfg *policy.PolicyConfig) (string, *runMeta, error) {
@@ -631,9 +643,7 @@ func execRunCommand(ctx context.Context, args map[string]any, cfg *policy.Policy
 	if timeoutSec <= 0 {
 		timeoutSec = 30
 	}
-	if timeoutSec > maxRunTimeoutSec {
-		timeoutSec = maxRunTimeoutSec
-	}
+	timeoutSec = clampRunTimeout(timeoutSec, cfg)
 	runCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 

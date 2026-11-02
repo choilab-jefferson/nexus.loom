@@ -3,3 +3,6 @@ bin/
 *.jsonl
 .worktrees/
 .wiki-state.json
+__pycache__/
+.pytest_cache/
+build/

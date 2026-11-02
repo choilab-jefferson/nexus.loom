@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -17,7 +18,6 @@ import (
 	"github.com/choilab-jefferson/nexus.loom/pkg/engine"
 	"github.com/choilab-jefferson/nexus.loom/pkg/policy"
 	"github.com/choilab-jefferson/nexus.loom/pkg/providers"
-	"github.com/choilab-jefferson/nexus.loom/pkg/stm"
 	"github.com/choilab-jefferson/nexus.loom/pkg/tools"
 	"github.com/choilab-jefferson/nexus.loom/pkg/trace"
 )
@@ -43,6 +43,7 @@ Usage:
   loom -p "<instruction>" [flags]     one-shot task
   loom run --task-file task.json      task from a JSON file
   loom resume <trace.jsonl>           resume an interrupted run
+  loom -p "<next>" --context-in ctx.json --context-out ctx.json   continue a conversation (one call = one user turn; "-" = stdin/stdout)
   loom capabilities --json            print tools/providers as JSON
   loom models --provider P [--json]   list model ids served to your key (network; opt-in)
   loom version
@@ -57,15 +58,15 @@ Core flags:
   --allow-cmd "cmd.."  allowlisted command prefix (repeatable)
   --max-total-tokens N, --deadline 90s, --max-tool-calls N   budgets (0 = unlimited)
   --max-output-tokens N per-response output cap (flag > spec > LOOM_MAX_OUTPUT_TOKENS > 8192)
+  --max-cmd-timeout S   run_command timeout_s clamp: seconds or 10m (flag > spec > LOOM_MAX_CMD_TIMEOUT > 300)
   --pass-env NAME[,NAME|PREFIX*]  extra env for run_command children (repeatable; secret names only by exact match)
   --trace file         JSONL trace path
   --json               emit result as JSON
-  --no-agents-md       do not load AGENTS.md into the prompt
+  --no-agents-md       do not load AGENTS.md into the prompt (or LOOM_NO_AGENTS_MD=1)
 
 Keys: ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY/GOOGLE_API_KEY, TYPESAFE_API_KEY.
 
 Nexus integration (optional; not needed standalone):
-  --stm / --no-stm     inject / skip the Nexus STM brief; "loom stm" inspects it
   --phi                local-only (PHI) model confinement
   ~/.config/nexus/tokens.env is read as a key fallback only if it exists;
   IKB_MCP_TOKEN from it is injected only into "ikb" subprocesses.
@@ -90,8 +91,6 @@ func runMain(args []string) int {
 			return runCapabilities(args[1:])
 		case "models":
 			return runModels(args[1:])
-		case "stm":
-			return runSTM(args[1:])
 		case "run":
 			return runSubcommand(args[1:])
 		case "resume":
@@ -109,13 +108,17 @@ type budgetFlags struct {
 	deadline       *time.Duration
 	maxToolCalls   *int
 	maxOutput      *int
+	maxCmdTimeout  *int
 	passEnv        *multiStringFlag
 }
 
 func addBudgetFlags(fs *flag.FlagSet) budgetFlags {
 	var passEnv multiStringFlag
 	fs.Var(&passEnv, "pass-env", "extra env var(s) for run_command children: NAME[,NAME|PREFIX*] (repeatable; secrets only by exact name)")
+	maxCmdTimeout := new(int)
+	fs.Var((*secondsFlag)(maxCmdTimeout), "max-cmd-timeout", "upper clamp for run_command timeout_s: seconds (600) or duration (10m) (0 = spec, then LOOM_MAX_CMD_TIMEOUT, then 300)")
 	return budgetFlags{
+		maxCmdTimeout:  maxCmdTimeout,
 		passEnv:        &passEnv,
 		maxOutput:      fs.Int("max-output-tokens", 0, "per-response output token cap (0 = spec, then LOOM_MAX_OUTPUT_TOKENS, then 8192)"),
 		maxTotalTokens: fs.Int("max-total-tokens", 0, "cumulative prompt+completion token budget (0 = unlimited)"),
@@ -135,6 +138,9 @@ func (b budgetFlags) apply(spec *engine.TaskSpec) {
 	if *b.maxToolCalls > 0 {
 		spec.Constraints.MaxToolCallsPerTurn = *b.maxToolCalls
 	}
+	if *b.maxCmdTimeout > 0 {
+		spec.Constraints.MaxCmdTimeoutSec = *b.maxCmdTimeout
+	}
 	if *b.maxOutput > 0 {
 		spec.Constraints.MaxOutputTokens = *b.maxOutput
 	}
@@ -146,6 +152,40 @@ func (b budgetFlags) apply(spec *engine.TaskSpec) {
 			}
 		}
 	}
+}
+
+// secondsFlag parses integer seconds ("600") or a duration ("10m") into whole seconds.
+type secondsFlag int
+
+func (s *secondsFlag) String() string {
+	if s == nil {
+		return "0"
+	}
+	return strconv.Itoa(int(*s))
+}
+
+func (s *secondsFlag) Set(v string) error {
+	n, err := parseSeconds(v)
+	if err != nil {
+		return err
+	}
+	*s = secondsFlag(n)
+	return nil
+}
+
+func parseSeconds(v string) (int, error) {
+	v = strings.TrimSpace(v)
+	if n, err := strconv.Atoi(v); err == nil {
+		if n < 0 {
+			return 0, fmt.Errorf("must be >= 0")
+		}
+		return n, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 0 {
+		return 0, fmt.Errorf("want integer seconds or a duration like 10m")
+	}
+	return int(d / time.Second), nil
 }
 
 func containsStr(list []string, s string) bool {
@@ -175,6 +215,15 @@ func applyPolicyExtras(spec engine.TaskSpec, pol *policy.PolicyConfig) {
 		pol.AllowCommands = policy.EffectiveAllowCommands([][]string(spec.Constraints.AllowCommands))
 	}
 	pol.PassEnv = spec.Constraints.PassEnv
+	secs := spec.Constraints.MaxCmdTimeoutSec
+	if secs <= 0 {
+		if n, err := parseSeconds(os.Getenv("LOOM_MAX_CMD_TIMEOUT")); err == nil {
+			secs = n
+		}
+	}
+	if secs > 0 {
+		pol.MaxCmdTimeoutSec = secs
+	}
 	for _, name := range pol.PassEnv {
 		if policy.IsSecretEnvName(name) {
 			fmt.Fprintf(os.Stderr, "loom warning: --pass-env exposes secret-looking variable %s to run_command children\n", name)
@@ -227,47 +276,19 @@ func capabilitiesMap() map[string]any {
 		"spec_version":       "0.1",
 		"invariants":         []string{"I1", "I2", "I3", "I4"},
 		"builtin_tools":      toolNames,
-		"providers":          []string{"ollama", "openai", "anthropic", "anthropic-api", "gemini", "gemini-api", "google-agent-platform", "typesafe", "mock"},
-		"subcommands":        []string{"run", "resume", "capabilities", "models", "stm", "version"},
+		"providers":          []string{"ollama", "openai", "anthropic", "anthropic-api", "gemini", "gemini-api", "google-agent-platform", "typesafe", "mock", "mock2"},
+		"subcommands":        []string{"run", "resume", "capabilities", "models", "version"},
 		"default_models":     defaultModels(),
-		"stm_integration":    true,
 		"agents_md_autoload": true,
-		"exit_codes":         exitCodeNames,
+		"context_continuation": map[string]any{
+			"schema":      engine.ContextSchema,
+			"flags":       []string{"--context-in", "--context-out"},
+			"task_keys":   []string{"context_in", "context_out"},
+			"stdio":       "- = stdin/stdout",
+			"broken_rule": "drop dangling tool_call and orphan tool_result; unknown schema or invalid JSON exits 2",
+		},
+		"exit_codes": exitCodeNames,
 	}
-}
-
-func runSTM(args []string) int {
-	fs := flag.NewFlagSet("stm", flag.ContinueOnError)
-	workspace := fs.String("workspace", ".", "workspace directory")
-	jsonOut := fs.Bool("json", false, "emit STM brief as JSON")
-	phiFlag := fs.Bool("phi", false, "redact STM node summaries under PHI policy")
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return policy.ExitOK
-		}
-		fmt.Fprintf(os.Stderr, "loom stm flag error: %v\n", err)
-		return policy.ExitHarnessErr
-	}
-
-	phiClamp := *phiFlag || strings.EqualFold(os.Getenv("NEXUS_SENSITIVITY"), "phi")
-	brief, err := stm.LoadBrief(*workspace, phiClamp)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "loom stm error: %v\n", err)
-		return policy.ExitHarnessErr
-	}
-
-	if *jsonOut {
-		raw, err := json.MarshalIndent(brief, "", "  ")
-		if err != nil {
-			return policy.ExitHarnessErr
-		}
-		fmt.Println(string(raw))
-		return policy.ExitOK
-	}
-	if fenced := brief.FormatFenced(); fenced != "" {
-		fmt.Println(fenced)
-	}
-	return policy.ExitOK
 }
 
 func runSubcommand(args []string) int {
@@ -281,11 +302,10 @@ func runSubcommand(args []string) int {
 	nonInteractive := fs.Bool("non-interactive", true, "unattended execution mode")
 	noDaemon := fs.Bool("no-daemon", false, "force in-process tool broker")
 	noAgentsMD := fs.Bool("no-agents-md", false, "disable automatic AGENTS.md loading into prefix")
-	stmFlag := fs.Bool("stm", false, "opt in to injecting Nexus STM brief (<nexus_stm>) for session continuity")
-	noSTM := fs.Bool("no-stm", false, "explicitly disable Nexus STM user-turn injection")
 	phiFlag := fs.Bool("phi", false, "enforce PHI local-only model confinement")
 	jsonFlag := fs.Bool("json", false, "emit TaskResult as JSON")
 	bf := addBudgetFlags(fs)
+	cf := addContextFlags(fs)
 	var allowCmds multiStringFlag
 	fs.Var(&allowCmds, "allow-cmd", "allowlisted command prefix, unioned with task.json constraints.allow_commands (repeatable)")
 
@@ -313,9 +333,10 @@ func runSubcommand(args []string) int {
 		spec.Agent = *agent
 	}
 	bf.apply(&spec)
+	cf.apply(&spec)
 	spec.Constraints.AllowCommands = append(spec.Constraints.AllowCommands, parseAllowCmds(allowCmds)...)
 
-	return executeSpec(spec, *workspace, *providerName, *modelName, *tracePath, *phiFlag, *noAgentsMD, *stmFlag, *noSTM, *jsonFlag)
+	return executeSpec(spec, *workspace, *providerName, *modelName, *tracePath, *phiFlag, *noAgentsMD, *jsonFlag)
 }
 
 func runPromptMode(args []string) int {
@@ -328,11 +349,10 @@ func runPromptMode(args []string) int {
 	maxContextTokens := fs.Int("max-context-tokens", 28000, "pre-send compaction token ceiling")
 	tracePath := fs.String("trace", "", "JSONL trace file path")
 	noAgentsMD := fs.Bool("no-agents-md", false, "disable automatic AGENTS.md loading into prefix")
-	stmFlag := fs.Bool("stm", false, "opt in to injecting Nexus STM brief (<nexus_stm>) for session continuity")
-	noSTM := fs.Bool("no-stm", false, "explicitly disable Nexus STM user-turn injection")
 	phiFlag := fs.Bool("phi", false, "enforce PHI local-only model confinement")
 	jsonFlag := fs.Bool("json", false, "emit TaskResult as JSON")
 	bf := addBudgetFlags(fs)
+	cf := addContextFlags(fs)
 	var allowCmds multiStringFlag
 	fs.Var(&allowCmds, "allow-cmd", "allowlisted command prefix (repeatable)")
 
@@ -362,14 +382,24 @@ func runPromptMode(args []string) int {
 		},
 	}
 	bf.apply(&spec)
+	cf.apply(&spec)
 
-	return executeSpec(spec, *workspace, *providerName, *modelName, *tracePath, *phiFlag, *noAgentsMD, *stmFlag, *noSTM, *jsonFlag)
+	return executeSpec(spec, *workspace, *providerName, *modelName, *tracePath, *phiFlag, *noAgentsMD, *jsonFlag)
 }
 
-func executeSpec(spec engine.TaskSpec, workspace, providerName, modelName, tracePath string, phiFlag, noAgentsMD, stmFlag, noSTM, jsonOut bool) int {
+func executeSpec(spec engine.TaskSpec, workspace, providerName, modelName, tracePath string, phiFlag, noAgentsMD, jsonOut bool) int {
 	if fi, err := os.Stat(workspace); err != nil || !fi.IsDir() {
 		fmt.Fprintf(os.Stderr, "loom error: invalid --workspace %q: not an accessible directory\n", workspace)
 		return policy.ExitHarnessErr
+	}
+	var prior *engine.Context
+	if spec.ContextIn != "" {
+		c, err := loadContext(spec.ContextIn)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "loom context error: %v\n", err)
+			return policy.ExitHarnessErr
+		}
+		prior = c
 	}
 	pol := policy.DefaultPolicyConfig(workspace)
 	pol.PHIMode = phiFlag || strings.EqualFold(os.Getenv("NEXUS_SENSITIVITY"), "phi")
@@ -377,20 +407,9 @@ func executeSpec(spec engine.TaskSpec, workspace, providerName, modelName, trace
 	applyPolicyExtras(spec, pol)
 
 	// Auto-load AGENTS.md into frozen PrefixHeader.RepoSummary (Invariant I2)
-	if !noAgentsMD && os.Getenv("NEXUS_NO_AGENTS_MD") != "1" && strings.TrimSpace(spec.RepoSummary) == "" {
-		if _, content := stm.DiscoverAgentsMD(workspace); content != "" {
+	if !noAgentsMD && os.Getenv("LOOM_NO_AGENTS_MD") != "1" && strings.TrimSpace(spec.RepoSummary) == "" {
+		if _, content := engine.DiscoverAgentsMD(workspace); content != "" {
 			spec.RepoSummary = content
-		}
-	}
-
-	// Optional Nexus STM injection: Loom runs independently by default; STM is injected only when
-	// explicitly requested via --stm, task.json "include_stm": true, or NEXUS_STM_INJECT=1.
-	wantSTM := (stmFlag || spec.IncludeSTM || os.Getenv("NEXUS_STM_INJECT") == "1") && !noSTM && os.Getenv("NEXUS_STM_INJECT") != "0"
-	if wantSTM {
-		if brief, err := stm.LoadBrief(workspace, pol.PHIMode); err == nil && brief != nil {
-			if fenced := brief.FormatFenced(); fenced != "" {
-				spec.Instruction = strings.TrimSpace(spec.Instruction) + "\n\n" + fenced
-			}
 		}
 	}
 
@@ -400,8 +419,14 @@ func executeSpec(spec engine.TaskSpec, workspace, providerName, modelName, trace
 		return policy.ExitHarnessErr
 	}
 
-	meta := runMeta{Workspace: workspace, Provider: providerName, Model: modelName, PHI: pol.PHIMode, Trace: tracePath}
-	return runAndReport(spec, pol, prov, meta, nil, jsonOut)
+	meta := runMeta{Workspace: workspace, Provider: providerName, Model: modelName, PHI: pol.PHIMode, Trace: tracePath, ContextOut: spec.ContextOut}
+	if prior != nil {
+		// Metadata only: the checkpoint already carries the messages.
+		p := *prior
+		p.Messages = nil
+		meta.Prior = &p
+	}
+	return runAndReport(spec, pol, prov, meta, nil, prior, jsonOut)
 }
 
 // runMeta is stored beside the checkpoint so `loom resume` can rebuild the run.
@@ -411,6 +436,10 @@ type runMeta struct {
 	Model     string `json:"model"`
 	PHI       bool   `json:"phi"`
 	Trace     string `json:"trace"`
+	// ContextOut / Prior let `loom resume` finish a context-continued run: Prior is the
+	// earlier context without its messages (runs and cumulative usage only).
+	ContextOut string          `json:"context_out,omitempty"`
+	Prior      *engine.Context `json:"prior,omitempty"`
 }
 
 type ckptFile struct {
@@ -438,7 +467,7 @@ func writeCkpt(meta runMeta, cp engine.Checkpoint) {
 	}
 }
 
-func runAndReport(spec engine.TaskSpec, pol *policy.PolicyConfig, prov providers.Provider, meta runMeta, resume *engine.Checkpoint, jsonOut bool) int {
+func runAndReport(spec engine.TaskSpec, pol *policy.PolicyConfig, prov providers.Provider, meta runMeta, resume *engine.Checkpoint, ctxIn *engine.Context, jsonOut bool) int {
 	release, lerr := acquireRunLocks(meta.Workspace, meta.Trace)
 	if lerr != nil {
 		fmt.Fprintln(os.Stderr, lerr)
@@ -456,7 +485,10 @@ func runAndReport(spec engine.TaskSpec, pol *policy.PolicyConfig, prov providers
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	opts := engine.RunOptions{Resume: resume, TracePath: meta.Trace}
+	opts := engine.RunOptions{Resume: resume, TracePath: meta.Trace, Context: ctxIn}
+	if ctxIn == nil && meta.Prior != nil {
+		opts.PriorUsage, opts.PriorUserTurn = meta.Prior.CumulativeUsage, meta.Prior.UserTurn
+	}
 	if meta.Trace != "" {
 		opts.OnCheckpoint = func(cp engine.Checkpoint) { writeCkpt(meta, cp) }
 	}
@@ -465,18 +497,33 @@ func runAndReport(spec engine.TaskSpec, pol *policy.PolicyConfig, prov providers
 		os.Remove(ckptPath(meta.Trace))
 	}
 
+	outW := resultWriter(meta.ContextOut)
+	if meta.ContextOut != "" && len(res.Msgs) > 0 {
+		base := ctxIn
+		if base == nil {
+			base = meta.Prior
+		}
+		if err := writeContext(meta.ContextOut, engine.BuildContext(base, res.Msgs, res)); err != nil {
+			fmt.Fprintf(os.Stderr, "loom context error: %v\n", err)
+			return policy.ExitHarnessErr
+		}
+		if meta.ContextOut != "-" {
+			res.ContextPath = meta.ContextOut
+		}
+	}
+
 	if res.ExitCode == policy.ExitEscalate && res.Escalation != nil {
 		raw, _ := json.Marshal(res.Escalation)
-		fmt.Println(string(raw))
+		fmt.Fprintln(outW, string(raw))
 		return policy.ExitEscalate
 	}
 
 	if jsonOut {
 		raw, _ := json.Marshal(res)
-		fmt.Println(string(raw))
+		fmt.Fprintln(outW, string(raw))
 	} else if res.Output != "" {
 		if res.ExitCode == policy.ExitOK {
-			fmt.Println(res.Output)
+			fmt.Fprintln(outW, res.Output)
 		} else {
 			fmt.Fprintln(os.Stderr, res.Output)
 		}
@@ -529,8 +576,11 @@ func runResume(args []string) int {
 		fmt.Fprintf(os.Stderr, "loom provider error: %v\n", err)
 		return policy.ExitHarnessErr
 	}
-	return runAndReport(spec, pol, prov, cf.Meta, &cf.Checkpoint, *jsonFlag)
+	return runAndReport(spec, pol, prov, cf.Meta, &cf.Checkpoint, nil, *jsonFlag)
 }
+
+// testProviderHook lets tests substitute a scripted provider for mock/mock2.
+var testProviderHook func(name string) providers.Provider
 
 func buildProvider(name, model string, phiMode bool) (providers.Provider, error) {
 	name, err := providers.ResolveProviderNamePHI(name, providers.OllamaReachable, phiMode)
@@ -555,10 +605,16 @@ func buildProvider(name, model string, phiMode bool) (providers.Provider, error)
 	case "typesafe", "jev":
 		p := providers.NewTypeSafeProvider("", "", model, phiMode)
 		return needKey(p, p.APIKey, phiMode, "TYPESAFE_API_KEY")
-	case "mock":
+	case "mock", "mock2":
+		if testProviderHook != nil {
+			if p := testProviderHook(name); p != nil {
+				return p, nil
+			}
+		}
 		return providers.NewScriptedMockProvider(providers.Response{
-			Content:       "mock task complete",
+			Content:       name + " task complete",
 			RawStopReason: "stop",
+			Provider:      name,
 		}), nil
 	default:
 		return nil, &policy.ViolationError{Reason: fmt.Sprintf("unknown provider %q", name)}
