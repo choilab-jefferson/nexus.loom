@@ -56,10 +56,19 @@ Core flags:
   --workspace dir      workspace root (default ".")
   --max-turns N        maximum agent turns (default 8)
   --allow-cmd "cmd.."  allowlisted command prefix (repeatable)
+  --tools a,b          expose only these built-in tools (repeatable; default all;
+                       run_command is never exposed without an --allow-cmd)
+  --read-glob G, --write-glob G  confine file tools to these workspace globs (repeatable;
+                       default "**"); a miss is a path_not_allowed observation.
+                       run_command children are NOT confined by these globs
+  --max-disallowed-tool-requests N  end with status constraint_failure (exit 1) when one tool
+                       is refused more than N times (not exposed / not allowlisted /
+                       path_not_allowed); unset = no limit
   --max-total-tokens N, --deadline 90s, --max-tool-calls N   budgets (0 = unlimited)
   --max-output-tokens N per-response output cap (flag > spec > LOOM_MAX_OUTPUT_TOKENS > 8192)
   --max-cmd-timeout S   run_command timeout_s clamp: seconds or 10m (flag > spec > LOOM_MAX_CMD_TIMEOUT > 300)
   --pass-env NAME[,NAME|PREFIX*]  extra env for run_command children (repeatable; secret names only by exact match)
+  --context-in F, --context-out F  continue from / write a loom.context.v1 file ("-" = stdin/stdout)
   --trace file         JSONL trace path
   --json               emit result as JSON
   --no-agents-md       do not load AGENTS.md into the prompt (or LOOM_NO_AGENTS_MD=1)
@@ -110,6 +119,8 @@ type budgetFlags struct {
 	maxOutput      *int
 	maxCmdTimeout  *int
 	passEnv        *multiStringFlag
+	maxToolResult  *int
+	keepToolResult *int
 }
 
 func addBudgetFlags(fs *flag.FlagSet) budgetFlags {
@@ -124,6 +135,8 @@ func addBudgetFlags(fs *flag.FlagSet) budgetFlags {
 		maxTotalTokens: fs.Int("max-total-tokens", 0, "cumulative prompt+completion token budget (0 = unlimited)"),
 		deadline:       fs.Duration("deadline", 0, "wall-clock deadline for the run, e.g. 90s (0 = none)"),
 		maxToolCalls:   fs.Int("max-tool-calls", 0, "reject a model turn returning more tool calls than this (0 = unlimited)"),
+		maxToolResult:  fs.Int("max-tool-result-bytes", 0, "cap each tool result fed back to the model, bytes (0 = spec, then 16384; clamped to 256..262144)"),
+		keepToolResult: fs.Int("keep-tool-results", 0, "keep only the last K tool results verbatim, older ones become their first lines (0 = spec, then keep all)"),
 	}
 }
 
@@ -143,6 +156,12 @@ func (b budgetFlags) apply(spec *engine.TaskSpec) {
 	}
 	if *b.maxOutput > 0 {
 		spec.Constraints.MaxOutputTokens = *b.maxOutput
+	}
+	if *b.maxToolResult > 0 {
+		spec.Constraints.MaxToolResultBytes = *b.maxToolResult
+	}
+	if *b.keepToolResult > 0 {
+		spec.Constraints.KeepToolResults = *b.keepToolResult
 	}
 	for _, raw := range *b.passEnv {
 		for _, name := range strings.Split(raw, ",") {
@@ -215,6 +234,19 @@ func applyPolicyExtras(spec engine.TaskSpec, pol *policy.PolicyConfig) {
 		pol.AllowCommands = policy.EffectiveAllowCommands([][]string(spec.Constraints.AllowCommands))
 	}
 	pol.PassEnv = spec.Constraints.PassEnv
+	pol.ReadonlyCommands = spec.Constraints.ReadonlyCommands
+	pol.ReadonlyGitCommonDirs = spec.Constraints.ReadonlyGitCommonDirs
+	pol.ReadonlyGlabGroups = spec.Constraints.ReadonlyGlabGroups
+	if n := spec.Constraints.MaxToolResultBytes; n > 0 {
+		pol.MaxOutputBytes = policy.ClampToolResultBytes(n)
+	}
+	if w := spec.Constraints.WriteGlobs; len(w) > 0 {
+		pol.WriteAllow = append([]string(nil), w...)
+	}
+	if r := spec.Constraints.ReadGlobs; len(r) > 0 {
+		// Written files stay readable so the model can verify its own output.
+		pol.ReadAllow = append(append([]string(nil), r...), spec.Constraints.WriteGlobs...)
+	}
 	secs := spec.Constraints.MaxCmdTimeoutSec
 	if secs <= 0 {
 		if n, err := parseSeconds(os.Getenv("LOOM_MAX_CMD_TIMEOUT")); err == nil {
@@ -287,6 +319,37 @@ func capabilitiesMap() map[string]any {
 			"stdio":       "- = stdin/stdout",
 			"broken_rule": "drop dangling tool_call and orphan tool_result; unknown schema or invalid JSON exits 2",
 		},
+		"read_only_commands": true,
+		"readonly_commands": map[string]any{
+			"tool":      "run_readonly",
+			"task_key":  "constraints.readonly_commands",
+			"default":   "off",
+			"enable":    policy.ReadonlySupported,
+			"allowlist": policy.ReadonlyAllowlist(),
+			"shell":     false,
+			"env":       "PATH, HOME, LANG, LC_*, TZ, XDG_CONFIG_HOME; GITLAB_*/GLAB_* only when named in constraints.pass_env",
+		},
+		"tool_result_cap": map[string]any{
+			"task_key": "constraints.max_tool_result_bytes",
+			"flag":     "--max-tool-result-bytes",
+			"default":  policy.DefaultPolicyConfig("").MaxOutputBytes,
+			"min":      policy.MinToolResultBytes,
+			"max":      policy.MaxToolResultBytes,
+			"marker":   "[loom:truncated N bytes in middle]",
+		},
+		"keep_tool_results": map[string]any{
+			"task_key": "constraints.keep_tool_results",
+			"flag":     "--keep-tool-results",
+			"default":  0,
+			"elided":   "[loom:elided bytes=N lines=N] followed by the first lines",
+		},
+		"capability_restriction": map[string]any{
+			"flags":           []string{"--tools", "--read-glob", "--write-glob", "--max-disallowed-tool-requests"},
+			"task_keys":       []string{"tools", "read_globs", "write_globs", "max_disallowed_tool_requests"},
+			"refusal_kinds":   []string{"tool_not_available", "allowlist", "path_not_allowed"},
+			"terminal_status": "constraint_failure",
+			"note":            "run_command and job tools are exposed only with a non-empty allowlist, run_readonly only with readonly_commands; read/write globs do not confine command children",
+		},
 		"exit_codes": exitCodeNames,
 	}
 }
@@ -306,6 +369,7 @@ func runSubcommand(args []string) int {
 	jsonFlag := fs.Bool("json", false, "emit TaskResult as JSON")
 	bf := addBudgetFlags(fs)
 	cf := addContextFlags(fs)
+	capf := addCapabilityFlags(fs)
 	var allowCmds multiStringFlag
 	fs.Var(&allowCmds, "allow-cmd", "allowlisted command prefix, unioned with task.json constraints.allow_commands (repeatable)")
 
@@ -334,6 +398,7 @@ func runSubcommand(args []string) int {
 	}
 	bf.apply(&spec)
 	cf.apply(&spec)
+	capf.apply(&spec)
 	spec.Constraints.AllowCommands = append(spec.Constraints.AllowCommands, parseAllowCmds(allowCmds)...)
 
 	return executeSpec(spec, *workspace, *providerName, *modelName, *tracePath, *phiFlag, *noAgentsMD, *jsonFlag)
@@ -353,6 +418,7 @@ func runPromptMode(args []string) int {
 	jsonFlag := fs.Bool("json", false, "emit TaskResult as JSON")
 	bf := addBudgetFlags(fs)
 	cf := addContextFlags(fs)
+	capf := addCapabilityFlags(fs)
 	var allowCmds multiStringFlag
 	fs.Var(&allowCmds, "allow-cmd", "allowlisted command prefix (repeatable)")
 
@@ -383,6 +449,7 @@ func runPromptMode(args []string) int {
 	}
 	bf.apply(&spec)
 	cf.apply(&spec)
+	capf.apply(&spec)
 
 	return executeSpec(spec, *workspace, *providerName, *modelName, *tracePath, *phiFlag, *noAgentsMD, *jsonFlag)
 }

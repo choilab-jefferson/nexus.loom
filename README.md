@@ -1,6 +1,6 @@
 # Loom
 
-Loom is a small, dependency-free (Go stdlib only) agent CLI. It runs one bounded coding task against a model of your choice (Ollama, Anthropic, OpenAI, Gemini, ...) with a fixed tool set (read, search, edit, write, allowlisted commands), a workspace sandbox, hard turn/token/time budgets, and a JSONL trace. It is built to run unattended as a leaf worker, and works standalone with zero configuration files.
+Loom is a small, dependency-free (Go stdlib only) agent CLI. It runs one bounded coding task against a model of your choice (Ollama, Anthropic, OpenAI, Gemini, ...) with a fixed tool set (read, search, edit, write, allowlisted commands, background jobs), a workspace sandbox, hard turn/token/time budgets, and a JSONL trace. It is built to run unattended as a leaf worker, and works standalone with zero configuration files.
 
 Loom is a single-agent CLI: one agent, one bounded task per run. It has no sub-agent or orchestration features; multi-agent orchestration belongs to nexus (see [Use from nexus.lite](#use-from-nexuslite)). Switching providers is one flag: see [`examples/provider_switch.py`](examples/provider_switch.py).
 
@@ -11,7 +11,8 @@ Loom is a single-agent CLI: one agent, one bounded task per run. It has no sub-a
 ```bash
 go install github.com/choilab-jefferson/nexus.loom/cmd/loom@latest   # needs Go 1.22+
 make build            # from a clone; produces ./bin/loom
-# or download a prebuilt binary: https://github.com/choilab-jefferson/nexus.loom/releases/download/v0.1.0/loom-<os>-<arch>
+# or download a prebuilt binary: https://github.com/choilab-jefferson/nexus.loom/releases/download/v0.2.3/loom-<os>-<arch>
+# or install via nexus-lite (PyPI): pip install nexus-lite && nexus-lite loom install
 ```
 
 Maintainers: see [docs/release.md](docs/release.md) for the GitHub snapshot publish procedure.
@@ -44,7 +45,11 @@ Run `loom` with no arguments (exit 2) or `loom --help` (exit 0) for the full lis
 | `--workspace` | workspace root; all file access is confined here |
 | `--allow-cmd "git status"` | allow a command prefix for `run_command` (repeatable; none by default). On `loom run` it is unioned with task.json `constraints.allow_commands`, then intersected with global/agent layers |
 | `--pass-env NAME[,NAME\|PREFIX*]` | extra env vars for `run_command` children (repeatable; also `run`/`resume`, spec `constraints.pass_env`). ML defaults (PYTHONPATH, CUDA_*, HF_HOME, ...) pass already; secrets (`*TOKEN*`, `*_API_KEY`, ...) only by exact name, with a warning |
+| `--tools a,b` | expose only these built-in tools to the model (repeatable; spec `constraints.tools`; default all). `run_command` is never exposed without `--allow-cmd`. A call to an unexposed tool returns a `tool_not_available` observation |
+| `--read-glob G` / `--write-glob G` | confine file tools to matching workspace paths (repeatable; spec `constraints.read_globs` / `write_globs`; default `**`). A miss is a recoverable `path_not_allowed` observation. **Does not confine `run_command` children** |
+| `--max-disallowed-tool-requests N` | end with status `constraint_failure` (exit 1) once one tool is refused more than N times (not exposed, not allowlisted, path not allowed); spec `constraints.max_disallowed_tool_requests`; unset = no limit |
 | `--max-cmd-timeout S` | `run_command` `timeout_s` clamp (default 300): integer seconds or duration like `10m`; flag > `constraints.max_cmd_timeout_sec` > `LOOM_MAX_CMD_TIMEOUT` |
+| `--max-tool-result-bytes N`, `--keep-tool-results K` | cap each tool result fed back to the model (default 16384, 256..262144); keep only the last K results verbatim, older ones become their first lines (also `run`/`resume`, spec `constraints.max_tool_result_bytes` / `constraints.keep_tool_results`) |
 | `--max-output-tokens N` | per-response output cap (also `run`/`resume`); flag > spec > `LOOM_MAX_OUTPUT_TOKENS` > 8192 |
 | `--max-turns`, `--max-total-tokens`, `--deadline`, `--max-tool-calls` | budgets |
 | `--trace file.jsonl`, `--json` | trace output, machine-readable result |
@@ -73,6 +78,21 @@ A dangling `tool_call` or orphan `tool_result` is dropped with a note on stderr;
 unknown `schema_version` exits 2. `loom resume <trace>` (interrupted run) is unchanged. Format and rules:
 [docs/contract.md](docs/contract.md#conversation-context-loomcontextv1).
 
+## Background jobs
+
+For long ML runs that exceed the `run_command` timeout clamp. Jobs run allowlisted argv (no shell) and outlive a single tool call.
+
+- `job_start(argv, detach?)` returns a `job_id`; `job_status(job_id)` gives status (`running`/`exited`/`killed`), exit code, pid.
+- `job_log(job_id, tail_n?)` returns the last lines of the log (default 50); `job_wait(job_id, timeout_s?)` blocks until exit (default 30, clamped like `run_command`) and returns status plus log tail.
+- `job_kill(job_id)` kills the job's process group.
+- State and output live in `<workspace>/.loom/jobs/<id>.{json,log}`; the checkpoint records `job_ids`, so `loom resume` can inspect, wait on, or kill them.
+- Non-detached jobs are killed when the run exits. `detach: true` jobs survive it and can be inspected from a later invocation on the same workspace.
+- The command must match `--allow-cmd`, same as `run_command`.
+
+```sh
+loom -p "train with train.py, detached, then report the log tail" --allow-cmd "python train.py"
+```
+
 ## Models
 
 Defaults: gemini `gemini-3.8-flash`, anthropic `claude-sonnet-5-5`, openai `gpt-4o-mini`, ollama `qwen3:4b` (`qwen3.5:4b-mlx` on macOS). Override with `--model` or `LOOM_MODEL`.
@@ -81,8 +101,11 @@ An unknown id fails fast on the first call with exit 2 and `loom: model "X" not 
 
 ## Safety model
 
-- File tools resolve symlinks and refuse paths outside `--workspace` or matching deny globs.
+- File tools resolve symlinks and refuse paths outside `--workspace` or matching deny globs; `--read-glob` / `--write-glob` narrow them further (recoverable refusal).
+- Only the tools in `--tools` are offered to the model; `run_command` is offered only when a command is allowlisted.
+- `run_command` children are not confined by the read/write globs: they run with your filesystem permissions. Do not rely on the globs to protect inputs when `run_command` is exposed.
 - `run_command` runs only allowlisted argv prefixes (global ∩ agent ∩ task), never through a shell; interpreter eval flags are rejected.
+- `job_start` uses the same allowlist, env scrub and process-group kill as `run_command`; non-detached jobs are killed when the run exits, `detach` jobs outlive it.
 - API keys are scrubbed from child-process environments and redacted in errors.
 - Budgets (turns, tokens, tool calls, deadline) end the run with a defined exit code and trace.
 - Three consecutive tool errors stop the run.
@@ -93,6 +116,7 @@ Many loom processes can run at once (e.g. one per task) if each has its own `--t
 
 - Distinct `--trace` paths never collide (the checkpoint is `<trace>.ckpt`, written atomically). `--trace ""` means no trace and no resume.
 - A second process on the same `--workspace` or the same `--trace` is refused immediately with exit 2 and a one-line error (advisory `flock`, released by the kernel when a process dies, so there are no stale locks and no lock files). Unix only; elsewhere the check is a no-op.
+- Background job state (`.loom/jobs`) is per workspace; detached jobs keep running after the lock is released.
 - Provider rate limits and API-key quotas are shared across processes, so many parallel runs may hit 429s.
 
 ## Exit codes
@@ -100,7 +124,7 @@ Many loom processes can run at once (e.g. one per task) if each has its own `--t
 | Exit Code | Constant | Meaning |
 |---|---|---|
 | `0` | `policy.ExitOK` | Task completed within turn budget |
-| `1` | `policy.ExitTaskFail` | Retryable task failure or `max_turns` exhausted |
+| `1` | `policy.ExitTaskFail` | Task failure: provider error, `max_turns` exhausted, tool-error strikes, or `constraint_failure` (repeated refused tool requests) |
 | `2` | `policy.ExitHarnessErr` | Fatal harness error, missing key, or `PolicyViolationError` |
 | `3` | `policy.ExitEscalate` | Structured `escalation_required` JSON payload emitted on stdout |
 | `4` | `policy.ExitBudget` | Token, deadline or tool-call budget exhausted |

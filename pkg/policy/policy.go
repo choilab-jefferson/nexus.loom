@@ -40,6 +40,8 @@ const (
 	KindAllowlist
 	// KindEvalFlag: shell/wrapper executable or inline-code/eval flag. Recoverable.
 	KindEvalFlag
+	// KindPathNotAllowed: in-workspace path outside ReadAllow/WriteAllow. Recoverable.
+	KindPathNotAllowed
 )
 
 // String returns the trace/contract name of the kind.
@@ -49,13 +51,17 @@ func (k ViolationKind) String() string {
 		return "allowlist"
 	case KindEvalFlag:
 		return "eval_flag"
+	case KindPathNotAllowed:
+		return "path_not_allowed"
 	default:
 		return "fatal"
 	}
 }
 
 // Recoverable reports whether the violation is returned to the model as a tool error.
-func (k ViolationKind) Recoverable() bool { return k == KindAllowlist || k == KindEvalFlag }
+func (k ViolationKind) Recoverable() bool {
+	return k == KindAllowlist || k == KindEvalFlag || k == KindPathNotAllowed
+}
 
 // ViolationKindOf returns the Kind of err if it is or wraps a *ViolationError.
 func ViolationKindOf(err error) (ViolationKind, bool) {
@@ -87,6 +93,16 @@ type PolicyConfig struct {
 	WriteAllow    []string
 	DenyGlobs     []string
 	AllowCommands [][]string
+	// ReadonlyCommands enables the run_readonly tool for these executables
+	// ("git", "glab"); empty (default) leaves the tool disabled.
+	ReadonlyCommands []string
+	// ReadonlyGitCommonDirs lists absolute git common dirs outside the
+	// workspace that run_readonly may use (the project's own repo, for a
+	// workspace that is a linked worktree). Empty: common dir must be inside.
+	ReadonlyGitCommonDirs []string
+	// ReadonlyGlabGroups lists the groups allowed as the first segment of a
+	// three-segment glab -R value.
+	ReadonlyGlabGroups []string
 	// PassEnv extends the run_command env allowlist: exact names or PREFIX* patterns.
 	PassEnv        []string
 	MaxReadLines   int
@@ -94,6 +110,25 @@ type PolicyConfig struct {
 	PHIMode        bool
 	// MaxCmdTimeoutSec is the upper clamp for run_command timeout_s (0 = 300).
 	MaxCmdTimeoutSec int
+	// Seen records what this run read and wrote (stale-write guard of write_file). nil = no guard.
+	Seen *SeenFiles
+}
+
+// Bounds for constraints.max_tool_result_bytes (per-result cap fed back to the model).
+const (
+	MinToolResultBytes = 256
+	MaxToolResultBytes = 1 << 18
+)
+
+// ClampToolResultBytes returns n clamped to [MinToolResultBytes, MaxToolResultBytes].
+func ClampToolResultBytes(n int) int {
+	if n < MinToolResultBytes {
+		return MinToolResultBytes
+	}
+	if n > MaxToolResultBytes {
+		return MaxToolResultBytes
+	}
+	return n
 }
 
 // DefaultPolicyConfig returns a baseline policy rooted at workspace.
@@ -108,6 +143,7 @@ func DefaultPolicyConfig(workspace string) *PolicyConfig {
 		MaxOutputBytes:   16384,
 		PHIMode:          false,
 		MaxCmdTimeoutSec: 300,
+		Seen:             NewSeenFiles(),
 	}
 }
 
@@ -282,7 +318,7 @@ func ResolveScopedPath(workspace, target string, write bool, cfg *PolicyConfig) 
 				if write {
 					mode = "write"
 				}
-				return "", &ViolationError{Reason: fmt.Sprintf("path %q not permitted for %s by allowlist", relSlash, mode)}
+				return "", &ViolationError{Reason: fmt.Sprintf("path %q not permitted for %s by allowlist", relSlash, mode), Kind: KindPathNotAllowed}
 			}
 		}
 	}
@@ -378,6 +414,10 @@ func matchGlob(pattern, relSlash string) bool {
 }
 
 // ValidateCommandArgv validates an argv vector against Loom v5.1 §9 rules.
+// evalHint tells the model what to do instead of inline code or a shell: models otherwise try another shell trick.
+const evalHint = "write the code to a file in the workspace (e.g. scripts/step.py) with write_file and run that file " +
+	"(e.g. python3 scripts/step.py); inline code, shells and command substitution are never run"
+
 func ValidateCommandArgv(argv []string, cfg *PolicyConfig) error {
 	if len(argv) == 0 {
 		return &ViolationError{Reason: "empty command argv"}
@@ -388,15 +428,15 @@ func ValidateCommandArgv(argv []string, cfg *PolicyConfig) error {
 	}
 	base := filepath.Base(bin)
 	if forbiddenWrappers[base] {
-		return &ViolationError{Reason: fmt.Sprintf("forbidden shell or wrapper executable %q", base), Kind: KindEvalFlag}
+		return &ViolationError{Reason: fmt.Sprintf("forbidden shell or wrapper executable %q; %s", base, evalHint), Kind: KindEvalFlag}
 	}
 	interp := interpreterBase(base)
 	for _, arg := range argv[1:] {
 		if interp && interpreterEvalFlags[arg] {
-			return &ViolationError{Reason: fmt.Sprintf("forbidden interpreter inline-code flag %q for %q", arg, base), Kind: KindEvalFlag}
+			return &ViolationError{Reason: fmt.Sprintf("forbidden interpreter inline-code flag %q for %q; %s", arg, base, evalHint), Kind: KindEvalFlag}
 		}
 		if arg == "-c" || arg == "--eval" || strings.Contains(arg, "$(") || strings.Contains(arg, "`") {
-			return &ViolationError{Reason: fmt.Sprintf("forbidden shell evaluation argument %q", arg), Kind: KindEvalFlag}
+			return &ViolationError{Reason: fmt.Sprintf("forbidden shell evaluation argument %q; %s", arg, evalHint), Kind: KindEvalFlag}
 		}
 	}
 	if cfg == nil || len(cfg.AllowCommands) == 0 {

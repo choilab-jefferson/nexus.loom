@@ -25,6 +25,7 @@ func TestFilesChangedCreateEditDelete(t *testing.T) {
 	pol := policy.DefaultPolicyConfig(ws)
 	mock := providers.NewScriptedMockProvider(
 		toolCallResp("1", "write_file", map[string]any{"path": "new.txt", "content": "n"}),
+		toolCallResp("2r", "read_file", map[string]any{"path": "edit.txt"}), // overwriting needs a current read
 		toolCallResp("2", "write_file", map[string]any{"path": "edit.txt", "content": "longer content"}),
 		toolCallResp("3", "write_file", map[string]any{"path": ".git/y", "content": "n"}),
 		providers.Response{Content: "done", RawStopReason: "stop"},

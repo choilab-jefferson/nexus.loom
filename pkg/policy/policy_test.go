@@ -261,3 +261,27 @@ func TestViolationKinds(t *testing.T) {
 		t.Errorf("path escape must stay fatal, got %v %v", k, ok)
 	}
 }
+
+func TestClampToolResultBytes(t *testing.T) {
+	for in, want := range map[int]int{-5: MinToolResultBytes, 10: MinToolResultBytes, 8192: 8192, 1 << 30: MaxToolResultBytes} {
+		if got := ClampToolResultBytes(in); got != want {
+			t.Errorf("ClampToolResultBytes(%d) = %d, want %d", in, got, want)
+		}
+	}
+	if d := DefaultPolicyConfig("").MaxOutputBytes; d < MinToolResultBytes || d > MaxToolResultBytes {
+		t.Errorf("compiled default %d outside clamp bounds", d)
+	}
+}
+
+// An inline-code refusal says what to do instead, so a model does not try another shell trick (loom-lite harness
+// runs, 2026-11-12: members retried `python3 -c` and `ls` until three refusals in a row ended the run).
+func TestEvalFlagRefusalsSayWhatToDoInstead(t *testing.T) {
+	fakeBins(t, "python3", "sh")
+	cfg := &PolicyConfig{AllowCommands: [][]string{{"python3"}, {"sh"}}}
+	for _, argv := range [][]string{{"python3", "-c", "print(1)"}, {"sh", "-c", "ls"}, {"python3", "x.py", "$(id)"}} {
+		err := ValidateCommandArgv(argv, cfg)
+		if err == nil || !strings.Contains(err.Error(), "write the code to a file in the workspace") {
+			t.Errorf("%v: refusal should say what to do instead, got %v", argv, err)
+		}
+	}
+}

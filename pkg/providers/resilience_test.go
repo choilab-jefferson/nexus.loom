@@ -251,3 +251,29 @@ func TestGeminiWire(t *testing.T) {
 		t.Fatalf("bad parse: %+v", resp)
 	}
 }
+
+func TestAnthropicToolResultCacheBreakpoint(t *testing.T) {
+	var path string
+	var hdr http.Header
+	var body map[string]any
+	srv := capture(t, `{"stop_reason":"end_turn","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1}}`, &path, &hdr, &body)
+	msgs := []compact.Message{
+		{Role: "user", Content: "q"},
+		{Role: "assistant", ToolCalls: []compact.ToolCall{{ID: "a", Name: "read_file"}, {ID: "b", Name: "read_file"}}},
+		{Role: "tool", ToolCallID: "a", Content: "r1"},
+		{Role: "tool", ToolCallID: "b", Content: "r2"},
+	}
+	if _, err := NewAnthropicProvider(srv.URL, "ak", "claude-x", false).Chat(context.Background(), wirePrefix, msgs, 64); err != nil {
+		t.Fatal(err)
+	}
+	blocks := body["messages"].([]any)[2].(map[string]any)["content"].([]any)
+	if len(blocks) != 2 {
+		t.Fatalf("want 2 merged tool_result blocks, got %d", len(blocks))
+	}
+	if _, ok := blocks[0].(map[string]any)["cache_control"]; ok {
+		t.Fatal("only the last tool_result may carry the breakpoint")
+	}
+	if blocks[1].(map[string]any)["cache_control"].(map[string]any)["type"] != "ephemeral" {
+		t.Fatalf("last tool_result lacks ephemeral breakpoint: %v", blocks[1])
+	}
+}

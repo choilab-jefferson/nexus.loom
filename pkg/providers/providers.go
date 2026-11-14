@@ -84,6 +84,16 @@ func NormalizeStopReason(raw string, toolCalls []compact.ToolCall) StopReason {
 	return RawStopKind(raw)
 }
 
+// geminiStopReason is NormalizeStopReason for the Gemini generateContent family (gemini, google-agent-platform):
+// Gemma MaaS on Agent Platform omits finishReason, so a text answer with none is a normal end (end_turn) instead of
+// an unknown stop. An empty answer with no finishReason stays unknown (retried once by the engine).
+func geminiStopReason(raw string, toolCalls []compact.ToolCall, content string) StopReason {
+	if raw == "" && len(toolCalls) == 0 && strings.TrimSpace(content) != "" {
+		return StopEndTurn
+	}
+	return NormalizeStopReason(raw, toolCalls)
+}
+
 // Response is the normalized model response returned by a Provider.
 type Response struct {
 	Content         string             `json:"content"`
@@ -220,7 +230,7 @@ func (p *OllamaProvider) Chat(ctx context.Context, prefix compact.PrefixHeader, 
 	}
 
 	var wireTools []map[string]any
-	for _, s := range tools.BuiltinSchemas() {
+	for _, s := range tools.ParseSchemasJSON(prefix.ToolSchemasJSON) {
 		wireTools = append(wireTools, map[string]any{
 			"type": "function",
 			"function": map[string]any{
@@ -375,7 +385,7 @@ func (p *OpenAIProvider) Chat(ctx context.Context, prefix compact.PrefixHeader, 
 	}
 
 	var wireTools []map[string]any
-	for _, s := range tools.BuiltinSchemas() {
+	for _, s := range tools.ParseSchemasJSON(prefix.ToolSchemasJSON) {
 		wireTools = append(wireTools, map[string]any{
 			"type": "function",
 			"function": map[string]any{
@@ -492,6 +502,24 @@ func NewAnthropicProvider(baseURL, apiKey, model string, phiMode bool) *Anthropi
 	}
 }
 
+// markLastToolResultCacheable puts an ephemeral cache breakpoint on the last tool_result
+// block, so the next turn reads the whole conversation up to here from cache instead of
+// paying it as uncached input. The frozen prefix and tools keep their own breakpoints.
+func markLastToolResultCacheable(wireMsgs []map[string]any) {
+	for i := len(wireMsgs) - 1; i >= 0; i-- {
+		blocks, ok := wireMsgs[i]["content"].([]map[string]any)
+		if !ok {
+			continue
+		}
+		for j := len(blocks) - 1; j >= 0; j-- {
+			if blocks[j]["type"] == "tool_result" {
+				blocks[j]["cache_control"] = map[string]any{"type": "ephemeral"}
+				return
+			}
+		}
+	}
+}
+
 func (p *AnthropicProvider) Chat(ctx context.Context, prefix compact.PrefixHeader, msgs []compact.Message, maxTokens int) (Response, error) {
 	if p.PHIMode {
 		return Response{}, &policy.ViolationError{
@@ -566,8 +594,10 @@ func (p *AnthropicProvider) Chat(ctx context.Context, prefix compact.PrefixHeade
 		})
 	}
 
+	markLastToolResultCacheable(wireMsgs)
+
 	var wireTools []map[string]any
-	schemas := tools.BuiltinSchemas()
+	schemas := tools.ParseSchemasJSON(prefix.ToolSchemasJSON)
 	for i, s := range schemas {
 		t := map[string]any{
 			"name":         s.Name,
@@ -892,7 +922,7 @@ func doGeminiGenerateContent(
 	}
 
 	var fnDecls []map[string]any
-	for _, s := range tools.BuiltinSchemas() {
+	for _, s := range tools.ParseSchemasJSON(prefix.ToolSchemasJSON) {
 		fnDecls = append(fnDecls, map[string]any{
 			"name":        s.Name,
 			"description": s.Description,
@@ -985,7 +1015,7 @@ func doGeminiGenerateContent(
 	return Response{
 		Content:         strings.Join(texts, "\n"),
 		ToolCalls:       tcs,
-		StopReason:      NormalizeStopReason(cand.FinishReason, tcs),
+		StopReason:      geminiStopReason(cand.FinishReason, tcs, strings.Join(texts, "\n")),
 		RawStopReason:   cand.FinishReason,
 		PromptTokens:    promptToks,
 		OutputTokens:    parsed.UsageMetadata.CandTokens,

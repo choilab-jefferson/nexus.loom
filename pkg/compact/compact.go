@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 // PrefixHeader holds the immutable run prefix (Invariant I2).
@@ -55,6 +56,11 @@ type Message struct {
 	ToolName   string     `json:"tool_name,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+
+	// Elided marks a tool message whose content was replaced by an elision or fold
+	// placeholder. Tracked by flag, never by content prefix, so tool output that happens
+	// to start with a placeholder prefix is still reduced.
+	Elided bool `json:"elided,omitempty"`
 }
 
 // CompactionStats reports token usage before and after pre-send compaction (Invariant I3).
@@ -140,10 +146,11 @@ func CompactMessages(prefix PrefixHeader, msgs []Message, maxContextTokens int, 
 		if out[i].Role != "tool" {
 			continue
 		}
-		if strings.HasPrefix(out[i].Content, "[loom:folded ") {
+		if out[i].Elided {
 			continue
 		}
 		out[i].Content = foldToolContent(i+1, out[i].Content)
+		out[i].Elided = true
 		stats.Compacted = true
 		stats.FoldedCount++
 	}
@@ -188,4 +195,81 @@ func extractSalientPreview(content string, maxLen int) string {
 		return candidate[:maxLen] + "..."
 	}
 	return candidate
+}
+
+const (
+	elidedPrefix     = "[loom:elided "
+	elidedMaxLines   = 3
+	elidedLineBytes  = 160
+	elidedTotalBytes = 400
+)
+
+// ElideOldToolResults keeps the last keep tool messages verbatim and replaces the
+// content of every older tool message with "[loom:elided bytes=N lines=M]" plus its
+// first non-empty lines. Tool-call pairing is untouched: only Content changes. Messages already
+// flagged Elided (elided or folded) and keep <= 0 are left alone. It returns a copy and the
+// number of messages elided by this call.
+func ElideOldToolResults(msgs []Message, keep int) ([]Message, int) {
+	if keep <= 0 {
+		return msgs, 0
+	}
+	var toolIdx []int
+	for i, m := range msgs {
+		if m.Role == "tool" {
+			toolIdx = append(toolIdx, i)
+		}
+	}
+	if len(toolIdx) <= keep {
+		return msgs, 0
+	}
+	out := make([]Message, len(msgs))
+	copy(out, msgs)
+	n := 0
+	for _, i := range toolIdx[:len(toolIdx)-keep] {
+		if out[i].Elided {
+			continue
+		}
+		out[i].Content = elideContent(out[i].Content)
+		out[i].Elided = true
+		n++
+	}
+	return out, n
+}
+
+func elideContent(content string) string {
+	var lines []string
+	total := 0
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if len(line) > elidedLineBytes {
+			line = cutUTF8(line, elidedLineBytes) + "..."
+		}
+		if total+len(line) > elidedTotalBytes {
+			break
+		}
+		lines = append(lines, line)
+		total += len(line)
+		if len(lines) == elidedMaxLines {
+			break
+		}
+	}
+	head := fmt.Sprintf("%sbytes=%d lines=%d]", elidedPrefix, len(content), strings.Count(content, "\n")+1)
+	if len(lines) == 0 {
+		return head
+	}
+	return head + "\n" + strings.Join(lines, "\n")
+}
+
+// cutUTF8 returns at most max bytes of s without splitting a rune.
+func cutUTF8(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max]
 }

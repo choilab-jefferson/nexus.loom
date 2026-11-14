@@ -3,6 +3,7 @@ package compact
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestPrefixHashDeterministic(t *testing.T) {
@@ -83,5 +84,73 @@ func TestWireHashTracksWireBytesAndSchemasSentOnce(t *testing.T) {
 	}
 	if WireHash("sys", "[]") == WireHash("sys2", "[]") {
 		t.Fatal("hash must change when wire system bytes change")
+	}
+}
+
+func TestElideOldToolResultsKeepsLastK(t *testing.T) {
+	big := "first line\nsecond line\n\nthird line\nfourth line\n" + strings.Repeat("x", 5000)
+	msgs := []Message{
+		{Role: "user", Content: "task"},
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "1", Name: "t"}}},
+		{Role: "tool", ToolCallID: "1", Content: big},
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "2", Name: "t"}}},
+		{Role: "tool", ToolCallID: "2", Content: big},
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "3", Name: "t"}}},
+		{Role: "tool", ToolCallID: "3", Content: big},
+	}
+	out, n := ElideOldToolResults(msgs, 1)
+	if n != 2 {
+		t.Fatalf("elided %d, want 2", n)
+	}
+	for _, i := range []int{2, 4} {
+		c := out[i].Content
+		if !strings.HasPrefix(c, "[loom:elided bytes=") || !strings.Contains(c, "first line\nsecond line\nthird line") || len(c) > 600 {
+			t.Fatalf("msg %d not elided as expected: %q", i, c)
+		}
+		if out[i].ToolCallID != msgs[i].ToolCallID {
+			t.Fatalf("tool call id lost on %d", i)
+		}
+	}
+	if out[6].Content != big || out[0].Content != "task" {
+		t.Fatal("last tool result and user prompt must stay verbatim")
+	}
+	if msgs[2].Content != big {
+		t.Fatal("input slice must not be mutated")
+	}
+	again, n2 := ElideOldToolResults(out, 1)
+	if n2 != 0 || again[2].Content != out[2].Content {
+		t.Fatalf("second pass must be a no-op, elided %d", n2)
+	}
+	if same, n3 := ElideOldToolResults(msgs, 3); n3 != 0 || same[2].Content != big {
+		t.Fatalf("keep >= tool count must be a no-op")
+	}
+	if _, n4 := ElideOldToolResults(msgs, 0); n4 != 0 {
+		t.Fatal("keep=0 means keep all")
+	}
+}
+
+func TestElideContentUTF8AndSingleLongLine(t *testing.T) {
+	got := elideContent(strings.Repeat("한", 500))
+	if !utf8.ValidString(got) || !strings.HasSuffix(got, "...") || len(got) > 300 {
+		t.Fatalf("bad elision: %q", got)
+	}
+	if elideContent("") != "[loom:elided bytes=0 lines=1]" {
+		t.Fatalf("empty: %q", elideContent(""))
+	}
+}
+
+func TestElideTracksFlagNotContentPrefix(t *testing.T) {
+	lookalike := "[loom:elided bytes=1 lines=1]\n" + strings.Repeat("workspace file body\n", 50)
+	msgs := []Message{
+		{Role: "user", Content: "task"},
+		{Role: "tool", ToolCallID: "1", Content: lookalike},
+		{Role: "tool", ToolCallID: "2", Content: "latest"},
+	}
+	out, n := ElideOldToolResults(msgs, 1)
+	if n != 1 || !out[1].Elided || out[2].Elided {
+		t.Fatalf("lookalike result must be elided by flag: n=%d %+v", n, out)
+	}
+	if _, n2 := ElideOldToolResults(out, 1); n2 != 0 {
+		t.Fatalf("flagged message must not be re-elided")
 	}
 }

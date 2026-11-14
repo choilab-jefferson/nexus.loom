@@ -76,3 +76,32 @@ func TestMaxCmdTimeoutFlagAndEnv(t *testing.T) {
 		t.Errorf("default = %d, want 300", pol.MaxCmdTimeoutSec)
 	}
 }
+
+func TestToolResultCapFlagsAndPolicy(t *testing.T) {
+	fs := flag.NewFlagSet("t", flag.ContinueOnError)
+	bf := addBudgetFlags(fs)
+	if err := fs.Parse([]string{"--max-tool-result-bytes", "4096", "--keep-tool-results", "2"}); err != nil {
+		t.Fatal(err)
+	}
+	spec := engine.TaskSpec{}
+	spec.Constraints.MaxToolResultBytes = 100000
+	bf.apply(&spec)
+	if spec.Constraints.MaxToolResultBytes != 4096 || spec.Constraints.KeepToolResults != 2 {
+		t.Fatalf("flags not applied: %+v", spec.Constraints)
+	}
+	pol := policy.DefaultPolicyConfig(t.TempDir())
+	def := pol.MaxOutputBytes
+	applyPolicyExtras(engine.TaskSpec{}, pol)
+	if pol.MaxOutputBytes != def {
+		t.Errorf("unset constraint must keep default %d, got %d", def, pol.MaxOutputBytes)
+	}
+	applyPolicyExtras(spec, pol)
+	if pol.MaxOutputBytes != 4096 {
+		t.Errorf("cap = %d, want 4096", pol.MaxOutputBytes)
+	}
+	spec.Constraints.MaxToolResultBytes = 5
+	applyPolicyExtras(spec, pol)
+	if pol.MaxOutputBytes != policy.MinToolResultBytes {
+		t.Errorf("tiny cap must clamp to %d, got %d", policy.MinToolResultBytes, pol.MaxOutputBytes)
+	}
+}

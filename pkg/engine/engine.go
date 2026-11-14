@@ -57,8 +57,37 @@ type TaskConstraints struct {
 	// PassEnv extends the run_command env allowlist (names or PREFIX* patterns).
 	// Secret-looking names pass only when listed exactly.
 	PassEnv []string `json:"pass_env,omitempty"`
+	// ReadonlyCommands enables the run_readonly tool for these executables
+	// (subset of ["git","glab"]); off by default. Secret-looking GITLAB_*/GLAB_*
+	// names reach its children only when also listed in PassEnv.
+	ReadonlyCommands []string `json:"readonly_commands,omitempty"`
+	// ReadonlyGitCommonDirs: absolute git common dirs outside the workspace that
+	// run_readonly may use (linked-worktree workspaces). Default: none.
+	ReadonlyGitCommonDirs []string `json:"readonly_git_common_dirs,omitempty"`
+	// ReadonlyGlabGroups: groups allowed as the first segment of a 3-segment
+	// glab -R value. Default: none (3-segment forms refused).
+	ReadonlyGlabGroups []string `json:"readonly_glab_groups,omitempty"`
 	// MaxCmdTimeoutSec raises/lowers the run_command timeout_s clamp (0 = policy default 300).
 	MaxCmdTimeoutSec int `json:"max_cmd_timeout_sec,omitempty"`
+	// MaxToolResultBytes caps each tool result fed back to the model (head and tail
+	// kept, "[loom:truncated N bytes in middle]" between). 0 = compiled default
+	// (policy.DefaultPolicyConfig MaxOutputBytes); clamped to
+	// [policy.MinToolResultBytes, policy.MaxToolResultBytes].
+	MaxToolResultBytes int `json:"max_tool_result_bytes,omitempty"`
+	// KeepToolResults keeps only the last K tool results verbatim in the running
+	// context; older ones are replaced by their first lines (0 = keep all).
+	KeepToolResults int `json:"keep_tool_results,omitempty"`
+	// Tools is the explicit set of built-in tools exposed to the model (empty = all).
+	// run_command is never exposed while the effective allow_commands list is empty.
+	Tools []string `json:"tools,omitempty"`
+	// MaxDisallowedToolRequests ends the run with status constraint_failure once one tool
+	// has been refused more than this many times (not exposed, allowlist rejection, path_not_allowed).
+	// nil = no limit; there is no default.
+	MaxDisallowedToolRequests *int `json:"max_disallowed_tool_requests,omitempty"`
+	// ReadGlobs / WriteGlobs confine the file tools (empty = "**"). A miss is the recoverable
+	// path_not_allowed observation. They do NOT confine run_command children.
+	ReadGlobs  []string `json:"read_globs,omitempty"`
+	WriteGlobs []string `json:"write_globs,omitempty"`
 }
 
 // TaskSpec represents a Loom v5.1 §5.2 task specification.
@@ -168,6 +197,9 @@ type Checkpoint struct {
 	Compactions int               `json:"compactions"`
 	// Baseline is the workspace snapshot taken at the first start; absent in old checkpoints.
 	Baseline *Snapshot `json:"baseline,omitempty"`
+	// JobIDs lists background jobs (.loom/jobs/<id>.json) started in this logical run, so a
+	// resumed run can job_status/job_wait/job_kill them.
+	JobIDs []string `json:"job_ids,omitempty"`
 }
 
 // RunOptions carries optional resume/checkpoint hooks.
@@ -197,6 +229,23 @@ type runState struct {
 	msgs     []compact.Message
 }
 
+// jobIDs merges job IDs from the resumed checkpoint with those started by this process.
+func (st *runState) jobIDs() []string {
+	var out []string
+	seen := map[string]bool{}
+	var prior []string
+	if st.opts.Resume != nil {
+		prior = st.opts.Resume.JobIDs
+	}
+	for _, id := range append(prior, tools.StartedJobIDs()...) {
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 func newRunID() string {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
@@ -212,9 +261,49 @@ Operate strictly within the workspace policy. Use built-in tools to inspect, edi
 If a task exceeds local capability or permissions, call the escalate tool.`
 
 // wireHash hashes the bytes providers actually send: the rendered system block plus the live
-// built-in tool schemas (re-read each call, so schema drift mid-run is detected).
-func wireHash(p compact.PrefixHeader) string {
-	return compact.WireHash(p.RenderSystemBlock(), tools.CanonicalToolSchemasJSON())
+// exposed tool schemas (re-read each call, so schema drift mid-run is detected).
+func wireHash(p compact.PrefixHeader, exposed []string) string {
+	s, err := tools.FilterSchemas(exposed)
+	if err != nil {
+		return ""
+	}
+	return compact.WireHash(p.RenderSystemBlock(), tools.SchemasJSON(s))
+}
+
+// countedRefusals are the recoverable refusals counted by MaxDisallowedToolRequests.
+var countedRefusals = map[string]bool{
+	tools.NotAvailableKind:             true,
+	policy.KindAllowlist.String():      true,
+	policy.KindPathNotAllowed.String(): true,
+}
+
+// commandTools run allowlisted commands (job_* manage what job_start started); none can
+// succeed while the effective allow_commands list is empty.
+var commandTools = map[string]bool{"run_command": true, "job_start": true, "job_status": true,
+	"job_log": true, "job_wait": true, "job_kill": true}
+
+// exposedTools resolves the tool names offered to the model: constraints.tools (or every
+// built-in), minus the tools that could never succeed in this run: the command tools when no
+// command is allowlisted, run_readonly when readonly_commands is not set.
+func exposedTools(requested []string, pol *policy.PolicyConfig) ([]string, error) {
+	schemas, err := tools.FilterSchemas(requested)
+	if err != nil {
+		return nil, err
+	}
+	names := []string{}
+	for _, s := range schemas {
+		if commandTools[s.Name] && len(pol.AllowCommands) == 0 {
+			continue
+		}
+		if s.Name == "run_readonly" && len(pol.ReadonlyCommands) == 0 {
+			continue
+		}
+		names = append(names, s.Name)
+	}
+	if len(names) == 0 {
+		return nil, fmt.Errorf("no tools left to expose (tools=%v, allow_commands empty)", requested)
+	}
+	return names, nil
 }
 
 // RunTask executes the bounded Loom M1 leaf loop enforcing Invariants I1, I2, I3, and I4.
@@ -238,6 +327,7 @@ func RunTaskWithOptions(ctx context.Context, spec TaskSpec, pol *policy.PolicyCo
 		st.baseline = TakeSnapshot(pol.Workspace, exclude)
 	}
 	res := runTask(ctx, spec, pol, prov, traceWriter, st)
+	tools.KillAttachedJobs() // non-detached background jobs die with the run
 	res.SchemaVersion = SchemaVersion
 	if res.Escalation != nil {
 		res.Escalation.SchemaVersion = SchemaVersion
@@ -306,6 +396,14 @@ func runTask(ctx context.Context, spec TaskSpec, pol *policy.PolicyConfig, prov 
 		}
 	}
 
+	if len(spec.Constraints.ReadonlyCommands) > 0 && len(spec.Constraints.AllowCommands) > 0 {
+		return TaskResult{
+			ExitCode: policy.ExitHarnessErr,
+			Status:   "harness_error",
+			Output:   "constraints.readonly_commands and constraints.allow_commands are mutually exclusive: a read-only task cannot also enable run_command",
+		}
+	}
+
 	maxTurns := spec.Constraints.MaxTurns
 	if maxTurns <= 0 {
 		maxTurns = 8
@@ -325,13 +423,25 @@ func runTask(ctx context.Context, spec TaskSpec, pol *policy.PolicyConfig, prov 
 		sysPrompt = defaultSystemPrompt
 	}
 
+	exposed, err := exposedTools(spec.Constraints.Tools, pol)
+	if err != nil {
+		return TaskResult{ExitCode: policy.ExitHarnessErr, Status: "harness_error", Output: err.Error()}
+	}
+	exposedSchemas, _ := tools.FilterSchemas(exposed)
+	exposedSet := make(map[string]bool, len(exposed))
+	for _, n := range exposed {
+		exposedSet[n] = true
+	}
+	disallowed := make(map[string]int)
+	disallowLimit := spec.Constraints.MaxDisallowedToolRequests
+
 	// Invariant I2: Freeze prefix at run start (§6.1)
 	prefix := compact.PrefixHeader{
 		SystemPrompt:    sysPrompt,
-		ToolSchemasJSON: tools.CanonicalToolSchemasJSON(),
+		ToolSchemasJSON: tools.SchemasJSON(exposedSchemas),
 		RepoSummary:     spec.RepoSummary,
 	}
-	frozenHash := wireHash(prefix)
+	frozenHash := wireHash(prefix, exposed)
 
 	_ = traceWriter.Emit(map[string]any{
 		"t":                  "run_start",
@@ -378,7 +488,7 @@ func runTask(ctx context.Context, spec TaskSpec, pol *policy.PolicyConfig, prov 
 			return ctxResult(ctx, st, turn-1, frozenHash, compactions)
 		}
 		// Invariant I2: Verify prefix hash has not drifted
-		currentHash := wireHash(prefix)
+		currentHash := wireHash(prefix, exposed)
 		if currentHash != frozenHash {
 			return TaskResult{
 				ExitCode:   policy.ExitHarnessErr,
@@ -386,6 +496,14 @@ func runTask(ctx context.Context, spec TaskSpec, pol *policy.PolicyConfig, prov 
 				Output:     "frozen_prefix_hash mutated mid-run",
 				Turns:      turn,
 				PrefixHash: frozenHash,
+			}
+		}
+
+		if k := spec.Constraints.KeepToolResults; k > 0 {
+			var elided int
+			msgs, elided = compact.ElideOldToolResults(msgs, k)
+			if elided > 0 {
+				_ = traceWriter.Emit(map[string]any{"t": "tool_results_elided", "turn": turn, "count": elided, "keep": k})
 			}
 		}
 
@@ -617,7 +735,7 @@ func runTask(ctx context.Context, spec TaskSpec, pol *policy.PolicyConfig, prov 
 				"kind":      "builtin",
 				"args_hash": trace.HashArgs(tc.Arguments),
 			}
-			if tc.Name == "run_command" {
+			if tc.Name == "run_command" || tc.Name == "job_start" || tc.Name == "run_readonly" {
 				if argv, ok := trace.RedactArgv(tc.Arguments); ok {
 					callEv["argv"] = argv
 				}
@@ -643,7 +761,13 @@ func runTask(ctx context.Context, spec TaskSpec, pol *policy.PolicyConfig, prov 
 				continue
 			}
 
-			res, toolErr := tools.Execute(ctx, tc.Name, tc.Arguments, pol)
+			var res tools.ToolResult
+			var toolErr error
+			if tools.IsBuiltin(tc.Name) && !exposedSet[tc.Name] {
+				res = tools.NotAvailable(tc.Name)
+			} else {
+				res, toolErr = tools.Execute(ctx, tc.Name, tc.Arguments, pol)
+			}
 			if toolErr != nil {
 				// Invariant I4: Fatal policy violation exits immediately with Exit Code 2
 				if policy.IsViolation(toolErr) {
@@ -734,6 +858,20 @@ func runTask(ctx context.Context, spec TaskSpec, pol *policy.PolicyConfig, prov 
 				ToolCallID: tc.ID,
 				Content:    res.Output,
 			})
+			if countedRefusals[res.ViolationKind] {
+				disallowed[tc.Name]++
+				if disallowLimit != nil && disallowed[tc.Name] > *disallowLimit {
+					st.reason = "constraint_failure"
+					return TaskResult{
+						ExitCode:    policy.ExitTaskFail,
+						Status:      "constraint_failure",
+						Output:      fmt.Sprintf("tool %s refused %d times (limit %d); last_error=%s", tc.Name, disallowed[tc.Name], *disallowLimit, res.Output),
+						Turns:       turn,
+						PrefixHash:  frozenHash,
+						Compactions: compactions,
+					}
+				}
+			}
 			if toolStrikes >= MaxToolStrikes {
 				return TaskResult{
 					ExitCode:    policy.ExitTaskFail,
@@ -755,6 +893,7 @@ func runTask(ctx context.Context, spec TaskSpec, pol *policy.PolicyConfig, prov 
 				Usage:       st.usage,
 				Compactions: compactions,
 				Baseline:    st.baseline,
+				JobIDs:      st.jobIDs(),
 			})
 			_ = traceWriter.Emit(map[string]any{"t": "checkpoint", "turn": turn, "run_id": st.runID})
 		}

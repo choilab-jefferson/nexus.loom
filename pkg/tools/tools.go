@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -61,16 +62,28 @@ type ToolSchema struct {
 func BuiltinSchemas() []ToolSchema {
 	schemas := []ToolSchema{
 		{
-			Name:        "edit_file",
-			Description: "Replace an exact target string in a workspace file with replacement.",
+			Name: "edit_file",
+			Description: "Change an existing workspace file by exact replacement blocks. Use this for ordinary changes " +
+				"(write_file only for a new file or a full rewrite). Each block's target must appear exactly once in the " +
+				"file as it is now (add surrounding lines to make it unique); all blocks are matched against the current " +
+				"file and applied together, or none is. Returns a unified diff of the change.",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"path":        map[string]any{"type": "string"},
-					"replacement": map[string]any{"type": "string"},
-					"target":      map[string]any{"type": "string"},
+					"path": map[string]any{"type": "string"},
+					"edits": map[string]any{
+						"type": "array",
+						"items": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"target":      map[string]any{"type": "string", "description": "exact current text, unique in the file"},
+								"replacement": map[string]any{"type": "string", "description": "text that replaces it"},
+							},
+							"required": []string{"target", "replacement"},
+						},
+					},
 				},
-				"required": []string{"path", "target", "replacement"},
+				"required": []string{"path", "edits"},
 			},
 		},
 		{
@@ -123,6 +136,20 @@ func BuiltinSchemas() []ToolSchema {
 			},
 		},
 		{
+			Name: "run_readonly",
+			Description: "Run a read-only git or glab command as an argv array (no shell). Enabled only when the task sets constraints.readonly_commands. " +
+				"git: log, show, diff, status, branch --list, rev-parse, ls-files, blame. " +
+				"glab: mr view|list|diff, issue view|list, ci status|list, api <path> (GET only, project/group merge_requests/issues/pipelines/jobs/repository/labels/milestones paths). Anything else is refused.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"argv":      map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+					"timeout_s": map[string]any{"type": "integer"},
+				},
+				"required": []string{"argv"},
+			},
+		},
+		{
 			Name:        "search",
 			Description: "Search workspace files with a regular expression, skipping binaries and denied paths.",
 			Parameters: map[string]any{
@@ -147,6 +174,64 @@ func BuiltinSchemas() []ToolSchema {
 				"required": []string{"path", "content"},
 			},
 		},
+		{
+			Name:        "job_kill",
+			Description: "Kill a background job's process group.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"job_id": map[string]any{"type": "string"},
+				},
+				"required": []string{"job_id"},
+			},
+		},
+		{
+			Name:        "job_log",
+			Description: "Return the last tail_n lines of a background job's log.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"job_id": map[string]any{"type": "string"},
+					"tail_n": map[string]any{"type": "integer"},
+				},
+				"required": []string{"job_id"},
+			},
+		},
+		{
+			Name:        "job_start",
+			Description: "Start an allowlisted command argv in the background (no shell); returns job_id. Non-detached jobs are killed when the run exits; detach=true jobs survive it.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"argv":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+					"detach": map[string]any{"type": "boolean"},
+				},
+				"required": []string{"argv"},
+			},
+		},
+		{
+			Name:        "job_status",
+			Description: "Return status (running/exited/killed), exit_code, pid and detached flag of a background job.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"job_id": map[string]any{"type": "string"},
+				},
+				"required": []string{"job_id"},
+			},
+		},
+		{
+			Name:        "job_wait",
+			Description: "Block up to timeout_s until a background job exits; returns final status and log tail.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"job_id":    map[string]any{"type": "string"},
+					"timeout_s": map[string]any{"type": "integer"},
+				},
+				"required": []string{"job_id"},
+			},
+		},
 	}
 	sort.Slice(schemas, func(i, j int) bool {
 		return schemas[i].Name < schemas[j].Name
@@ -156,11 +241,75 @@ func BuiltinSchemas() []ToolSchema {
 
 // CanonicalToolSchemasJSON returns a deterministically sorted, compact JSON array of tool schemas (§6.1).
 func CanonicalToolSchemasJSON() string {
-	raw, err := json.Marshal(BuiltinSchemas())
+	return SchemasJSON(BuiltinSchemas())
+}
+
+// FilterSchemas returns the built-in schemas named in names, in canonical order.
+// nil or empty names means the full built-in set; an unknown name is an error.
+func FilterSchemas(names []string) ([]ToolSchema, error) {
+	all := BuiltinSchemas()
+	if len(names) == 0 {
+		return all, nil
+	}
+	want := make(map[string]bool, len(names))
+	for _, n := range names {
+		want[n] = true
+	}
+	out := []ToolSchema{}
+	for _, s := range all {
+		if want[s.Name] {
+			out = append(out, s)
+			delete(want, s.Name)
+		}
+	}
+	for n := range want {
+		return nil, fmt.Errorf("unknown tool %q in tool set", n)
+	}
+	return out, nil
+}
+
+// SchemasJSON is the compact JSON array of schemas (the form frozen in the run prefix).
+func SchemasJSON(schemas []ToolSchema) string {
+	if schemas == nil {
+		schemas = []ToolSchema{}
+	}
+	raw, err := json.Marshal(schemas)
 	if err != nil {
 		return "[]"
 	}
 	return string(raw)
+}
+
+// ParseSchemasJSON decodes a prefix's tool schemas. An empty string means the full
+// built-in set (callers that never froze a tool set); "[]" or invalid JSON means no tools.
+func ParseSchemasJSON(raw string) []ToolSchema {
+	if strings.TrimSpace(raw) == "" {
+		return BuiltinSchemas()
+	}
+	var out []ToolSchema
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return []ToolSchema{} // fail closed: an unreadable tool set exposes nothing
+	}
+	return out
+}
+
+// NotAvailableKind is the ViolationKind of a call to a built-in tool that is not exposed.
+const NotAvailableKind = "tool_not_available"
+
+// NotAvailable is the observation for a call to a tool the run does not expose; nothing runs.
+func NotAvailable(name string) ToolResult {
+	out := fmt.Sprintf(`{"status":%q,"tool":%q}`, NotAvailableKind, name)
+	return ToolResult{Output: out, BytesRaw: len(out), BytesPassed: len(out), IsError: true, ViolationKind: NotAvailableKind}
+}
+
+// IsBuiltin reports whether name is a built-in tool.
+func IsBuiltin(name string) bool {
+	for _, s := range BuiltinSchemas() {
+		if s.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // Execute runs a built-in tool confined by cfg.
@@ -175,6 +324,13 @@ func Execute(ctx context.Context, name string, args map[string]any, cfg *policy.
 		err    error
 		meta   *runMeta
 	)
+	if len(cfg.ReadonlyCommands) > 0 {
+		switch name {
+		case "write_file", "edit_file", "run_command", "job_start":
+			err = &policy.ViolationError{Reason: fmt.Sprintf("%s is disabled in a task that enables run_readonly (read-only tasks cannot write or run commands)", name), Kind: policy.KindAllowlist}
+			return clampResult(fmt.Sprintf("error: %v", err), true, cfg.MaxOutputBytes).withViolation(policy.KindAllowlist), nil
+		}
+	}
 	switch name {
 	case "read_file":
 		rawOut, err = execReadFile(args, cfg)
@@ -188,6 +344,18 @@ func Execute(ctx context.Context, name string, args map[string]any, cfg *policy.
 		rawOut, err = execWriteFile(args, cfg)
 	case "run_command":
 		rawOut, meta, err = execRunCommand(ctx, args, cfg)
+	case "run_readonly":
+		rawOut, meta, err = execReadonly(ctx, args, cfg)
+	case "job_start":
+		rawOut, err = execJobStart(args, cfg)
+	case "job_status":
+		rawOut, err = execJobStatus(args, cfg)
+	case "job_log":
+		rawOut, err = execJobLog(args, cfg)
+	case "job_wait":
+		rawOut, err = execJobWait(ctx, args, cfg)
+	case "job_kill":
+		rawOut, err = execJobKill(args, cfg)
 	case "escalate":
 		sig := parseEscalation(args)
 		outBytes, _ := json.Marshal(sig)
@@ -225,6 +393,11 @@ func Execute(ctx context.Context, name string, args map[string]any, cfg *policy.
 		res.Truncated = res.Truncated || meta.truncated
 	}
 	return res, nil
+}
+
+func (r ToolResult) withViolation(k policy.ViolationKind) ToolResult {
+	r.ViolationKind = k.String()
+	return r
 }
 
 func truncMarker(dropped int) string {
@@ -282,6 +455,7 @@ func execReadFile(args map[string]any, cfg *policy.PolicyConfig) (string, error)
 	if err != nil {
 		return "", err
 	}
+	cfg.Seen.Record(resolved, data) // the run has seen this content (write_file's stale guard)
 	lines := strings.Split(string(data), "\n")
 	startLine := getInt(args, "start_line", 1)
 	if startLine < 1 {
@@ -421,40 +595,12 @@ func isBinaryContent(data []byte) bool {
 	return !utf8.Valid(sample)
 }
 
-func execEditFile(args map[string]any, cfg *policy.PolicyConfig) (string, error) {
-	relPath := getString(args, "path")
-	target := getString(args, "target")
-	replacement := getString(args, "replacement")
-	if target == "" {
-		return "", fmt.Errorf("edit_file requires non-empty target")
-	}
-	resolved, err := policy.ResolveScopedPath(cfg.Workspace, relPath, true, cfg)
-	if err != nil {
-		return "", err
-	}
-	data, err := os.ReadFile(resolved)
-	if err != nil {
-		return "", err
-	}
-	content := string(data)
-	if !strings.Contains(content, target) {
-		return "", fmt.Errorf("target string not found in %s", relPath)
-	}
-	updated := strings.Replace(content, target, replacement, 1)
-	if err := writeNoFollow(resolved, []byte(updated)); err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("edited %s", filepath.ToSlash(relPath)), nil
-}
-
-// writeNoFollow writes data to path, refusing to follow a symlink at the leaf.
-func writeNoFollow(path string, data []byte) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o644)
-	if err != nil {
+// rewriteLocked replaces the whole content of an open, locked file.
+func rewriteLocked(f *os.File, data []byte) error {
+	if err := f.Truncate(0); err != nil {
 		return err
 	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
+	if _, err := f.WriteAt(data, 0); err != nil {
 		return err
 	}
 	return f.Close()
@@ -470,10 +616,37 @@ func execWriteFile(args map[string]any, cfg *policy.PolicyConfig) (string, error
 	if err := os.MkdirAll(filepath.Dir(resolved), 0o755); err != nil {
 		return "", err
 	}
-	if err := writeNoFollow(resolved, []byte(content)); err != nil {
+	_, statErr := os.Lstat(resolved)
+	existed := statErr == nil
+	f, err := openLocked(resolved, true) // waits while another process writes the same file
+	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("wrote %d bytes to %s", len(content), filepath.ToSlash(relPath)), nil
+	defer f.Close()
+	rel := filepath.ToSlash(relPath)
+	if existed && cfg.Seen != nil {
+		// overwrite only what this run has seen as it is now (PI 2026-11-13: check right before the change)
+		cur, err := io.ReadAll(f)
+		if err != nil {
+			return "", err
+		}
+		seen, ok := cfg.Seen.Lookup(resolved)
+		switch {
+		case !ok:
+			return "", fmt.Errorf("%s exists and was not read in this run: read it first, or change it with edit_file", rel)
+		case seen != policy.ContentHash(cur):
+			return "", fmt.Errorf("%s changed since you read it (another process wrote it): read it again before overwriting, or use edit_file", rel)
+		}
+	}
+	if err := rewriteLocked(f, []byte(content)); err != nil {
+		return "", err
+	}
+	cfg.Seen.Record(resolved, []byte(content))
+	what := "created"
+	if existed {
+		what = "replaced"
+	}
+	return fmt.Sprintf("wrote %d bytes to %s (%s)", len(content), rel, what), nil
 }
 
 // safeEnvKeys is the env allowlist for run_command children. Everything else
@@ -644,6 +817,14 @@ func execRunCommand(ctx context.Context, args map[string]any, cfg *policy.Policy
 		timeoutSec = 30
 	}
 	timeoutSec = clampRunTimeout(timeoutSec, cfg)
+	env := scrubSubprocessEnv(os.Environ(), argv[0], cfg.PassEnv...)
+	return runChild(ctx, resolved, argv, wsReal, env, timeoutSec, maxRunOutput)
+}
+
+// runChild execs resolved with argv (argv[0] kept as the caller's name), cwd dir
+// and exactly env, under a timeout, killing the whole process group on timeout
+// or return. Output (stdout+stderr) is capped at maxBytes, head + tail kept.
+func runChild(ctx context.Context, resolved string, argv []string, dir string, env []string, timeoutSec, maxBytes int) (string, *runMeta, error) {
 	runCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 
@@ -652,12 +833,12 @@ func execRunCommand(ctx context.Context, args map[string]any, cfg *policy.Policy
 	// alpine, where yes/sleep are symlinks) dispatch on it, and the resolved
 	// path is the symlink target.
 	cmd.Args[0] = argv[0]
-	cmd.Dir = wsReal
-	cmd.Env = scrubSubprocessEnv(os.Environ(), argv[0], cfg.PassEnv...)
+	cmd.Dir = dir
+	cmd.Env = env
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	cmd.WaitDelay = runWaitDelay
-	combined := &cappedBuffer{max: maxRunOutput}
+	combined := &cappedBuffer{max: maxBytes}
 	cmd.Stdout = combined
 	cmd.Stderr = combined
 

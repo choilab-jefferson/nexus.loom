@@ -140,14 +140,37 @@ func runLoomExpect2(t *testing.T, bin, ws, tr, want string) {
 	}
 }
 
-func TestSameWorkspaceRefused(t *testing.T) {
+// Parallel runs may share one workspace (PI 2026-11-13: a team of members works in one project directory); only
+// writes to the same file are serialised, by a per-file lock in the write tools (pkg/tools).
+func TestParallelRunsShareAWorkspace(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds and spawns processes")
 	}
 	bin := buildLoom(t)
-	ws := t.TempDir()
+	ws, traces := t.TempDir(), t.TempDir()
 	startHolder(t, ws, "")
-	runLoomExpect2(t, bin, ws, filepath.Join(t.TempDir(), "o.jsonl"), "workspace")
+	const n = 4
+	var wg sync.WaitGroup
+	errs := make([]string, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			cmd := exec.Command(bin, "-p", "shared workspace", "--provider", "mock", "--workspace", ws,
+				"--trace", filepath.Join(traces, fmt.Sprintf("t%d.jsonl", i)))
+			var out bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &out, &out
+			if err := cmd.Run(); err != nil {
+				errs[i] = fmt.Sprintf("%v: %s", err, out.String())
+			}
+		}(i)
+	}
+	wg.Wait()
+	for i, e := range errs {
+		if e != "" {
+			t.Fatalf("run %d in a shared workspace failed: %s", i, e)
+		}
+	}
 }
 
 func TestSameTraceRefused(t *testing.T) {

@@ -193,8 +193,9 @@ func TestWriteNoFollowLeafSwap(t *testing.T) {
 	if err := os.Symlink(target, leaf); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeNoFollow(leaf, []byte("x")); err == nil {
-		t.Fatal("writeNoFollow followed symlink")
+	if f, err := openLocked(leaf, true); err == nil {
+		f.Close()
+		t.Fatal("openLocked followed symlink")
 	}
 	if _, err := os.Lstat(target); err == nil {
 		t.Fatal("outside file created")
@@ -392,5 +393,21 @@ func TestClampRunTimeout(t *testing.T) {
 	cfg.MaxCmdTimeoutSec = 0
 	if got := clampRunTimeout(999999, cfg); got != 300 {
 		t.Errorf("zero falls back to 300, got %d", got)
+	}
+}
+
+func TestExecuteHonoursConfiguredResultCap(t *testing.T) {
+	ws := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ws, "big.txt"), []byte(strings.Repeat("0123456789abcdef\n", 300)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pol := policy.DefaultPolicyConfig(ws)
+	pol.MaxOutputBytes = 1024
+	res, err := Execute(context.Background(), "read_file", map[string]any{"path": "big.txt"}, pol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Truncated || res.BytesPassed > 1024 || !strings.Contains(res.Output, "[loom:truncated ") || len(res.Output) > 1100 {
+		t.Fatalf("cap not applied: truncated=%v passed=%d len=%d", res.Truncated, res.BytesPassed, len(res.Output))
 	}
 }
