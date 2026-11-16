@@ -18,6 +18,9 @@ import (
 // TestMain doubles as a lock-holder helper: the test binary re-executed with
 // LOOM_TEST_HOLD=<workspace>|<trace> takes the run locks and blocks on stdin.
 func TestMain(m *testing.M) {
+	if a := os.Getenv("LOOM_TEST_SERVE"); a != "" {
+		os.Exit(serveHelper(a))
+	}
 	if h := os.Getenv("LOOM_TEST_HOLD"); h != "" {
 		ws, tr, _ := strings.Cut(h, "|")
 		rel, err := acquireRunLocks(ws, tr)

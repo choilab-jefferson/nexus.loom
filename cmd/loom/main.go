@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/choilab-jefferson/nexus.loom/pkg/engine"
+	"github.com/choilab-jefferson/nexus.loom/pkg/filebus"
 	"github.com/choilab-jefferson/nexus.loom/pkg/policy"
 	"github.com/choilab-jefferson/nexus.loom/pkg/providers"
 	"github.com/choilab-jefferson/nexus.loom/pkg/tools"
@@ -44,6 +45,7 @@ Usage:
   loom run --task-file task.json      task from a JSON file
   loom resume <trace.jsonl>           resume an interrupted run
   loom -p "<next>" --context-in ctx.json --context-out ctx.json   continue a conversation (one call = one user turn; "-" = stdin/stdout)
+  loom serve --bus-dir DIR --name ID [run flags]   loop mode: long-lived loom controlled over the nexus file bus (see README "Loop mode")
   loom capabilities --json            print tools/providers as JSON
   loom models --provider P [--json]   list model ids served to your key (network; opt-in)
   loom version
@@ -104,6 +106,8 @@ func runMain(args []string) int {
 			return runSubcommand(args[1:])
 		case "resume":
 			return runResume(args[1:])
+		case "serve":
+			return runServe(args[1:])
 		case "version", "--version":
 			return runVersionCmd()
 		}
@@ -309,7 +313,7 @@ func capabilitiesMap() map[string]any {
 		"invariants":         []string{"I1", "I2", "I3", "I4"},
 		"builtin_tools":      toolNames,
 		"providers":          []string{"ollama", "openai", "anthropic", "anthropic-api", "gemini", "gemini-api", "google-agent-platform", "typesafe", "mock", "mock2"},
-		"subcommands":        []string{"run", "resume", "capabilities", "models", "version"},
+		"subcommands":        []string{"run", "resume", "serve", "capabilities", "models", "version"},
 		"default_models":     defaultModels(),
 		"agents_md_autoload": true,
 		"context_continuation": map[string]any{
@@ -318,6 +322,12 @@ func capabilitiesMap() map[string]any {
 			"task_keys":   []string{"context_in", "context_out"},
 			"stdio":       "- = stdin/stdout",
 			"broken_rule": "drop dangling tool_call and orphan tool_result; unknown schema or invalid JSON exits 2",
+		},
+		"loop_mode": map[string]any{
+			"bus_format":  filebus.Format,
+			"bus_version": filebus.MajorVersion,
+			"kinds":       append(append([]string{}, loopKindsIn...), loopKindsOut...),
+			"command":     "loom serve --bus-dir DIR --name ID",
 		},
 		"read_only_commands": true,
 		"readonly_commands": map[string]any{

@@ -50,7 +50,8 @@ Built by `capabilitiesMap()` (`cmd/loom/main.go:160`). Always a JSON object.
 | `commit` | string | Same ldflags value as `loom version`; `"unknown"` when unstamped |
 | `harness` | string | `"loom"` |
 | `context_continuation` | object | `schema` (`loom.context.v1`), `flags`, `task_keys`, `stdio`, `broken_rule`. Present from v0.2.3. |
-| `subcommands` | array | `run`, `resume`, `capabilities`, `models`, `version` (additive) |
+| `subcommands` | array | `run`, `resume`, `serve`, `capabilities`, `models`, `version` (additive) |
+| `loop_mode` | object | `bus_format` (`nexus.filebus`), `bus_version` (1), `kinds` (message kinds loom handles or emits), `command`. Additive; see "Loop mode". |
 | `default_models` | object | provider -> default model id (additive); `LOOM_MODEL` / `--model` override |
 | `spec_version` | string | `"0.1"` |
 | `invariants` | string[] | `I1`..`I4` |
@@ -342,3 +343,21 @@ Execution: no shell; cwd = the task workspace (resolved); `Setpgid`, whole proce
 Denials are recoverable tool errors with `violation_kind` `allowlist` (counted toward the tool-error strike limit); there is no fatal path. Trace: no new event types. `tool_call` carries redacted `argv` (same rules as `run_command`); `tool_result` carries `exit_code` and `timed_out`; a denial adds `policy_violation_recovered` with `tool` `run_readonly`.
 
 Not a sandbox: the config check narrows but does not remove trust in the repository's own files (for example `.gitattributes` only matters if a filter is configured, which is refused). glab sends the passed token to the host in the workspace remote or `GITLAB_HOST` chosen by the host, never to a model-chosen host.
+
+## Loop mode (`loom serve`, additive)
+
+Control plane for a long-lived loom over the nexus file bus; the bus layout, id grammar, cursors and session files are specified in nexus.lite `docs/specs/file-bus.md` (bus format `nexus.filebus` v1) and implemented by `pkg/filebus`. Command: `loom serve --bus-dir DIR --name ID [run flags] [--max-turns N] [--max-wall D] [--idle-timeout D] [--on-job-exit notify|turn]`. Loom is non-interactive and never opens SQLite.
+
+State: `state/<ID>.context.json` (one persistent `loom.context.v1`), `state/<ID>.json` (private: `inflight`, `reply_to`, `trace`, `last_trace`, `peer`), per-turn trace `state/<ID>.traces/<request id>.jsonl` plus its `.ckpt`. Pointers in messages are bus-relative when inside the bus dir.
+
+Host -> loom kinds (`data`): `loom.task` / `loom.prompt` `{prompt, context_files?, constraints?}` (an empty `prompt` falls back to the body; of `constraints` only `max_turns`, `deadline_ms`, `max_total_tokens`, `max_output_tokens`, `max_tool_calls_per_turn` are read, and only to lower the serve-level value); `loom.inject` `{messages?: [{role, content}], files?: [path]}`; `loom.extract` `{what: "context"|"summary"}`; `loom.stop` `{reason?}`; `loom.resume` `{checkpoint?}` (a trace path or its `.ckpt`, bus-relative or absolute; default = the last turn). Unknown kinds are acked and ignored.
+
+Loom -> host kinds, addressed to `meta.reply_to` else the request's `sender`, always with `meta.corr` = request id:
+- `loom.result`: body = the turn's output; `data` `{request, status, exit_code, turns, user_turn, usage, trace, context_path?, run_id?, escalation?}`. `status`/`exit_code` as in section 3 (exit 3 does not end the loop). A failed control message (no checkpoint, unknown extract target, empty prompt) is answered with `status: harness_error`, `exit_code: 2` and `data.reason`; it is acked and loom keeps serving (exit 2 is only for startup/config errors). A turn lost to a crash: `status: interrupted`, `exit_code: 130`.
+- `loom.extracted`: `{request, path: "blob/<t>/<id>.json", sha256, schema: "loom.context.v1"|"loom.summary.v1"}`; the summary blob is `{schema_version, summary}`, built without a model call.
+- `loom.state`: `{state: started|idle|busy|stopped|exiting, reason?, turns_used, wall_ms}`.
+- `job`: shared job event (spec 13.6) for `.loom/jobs` jobs: `summary` `<job_id> <verdict> rc=<rc>`, `data` `{name, verdict, rc, run_dir: ".loom/jobs/<id>.json", ts, supervisor: "loom", job_id}`; `RUNNING` on start, then `OK` (rc 0), `FAIL`, `GONE` (process vanished, rc null) or `KILLED`. Jobs already present at startup are not reported, except that a still-running one is reported when it ends.
+
+Exit codes: 0 `loom.stop` or `--idle-timeout`; 4 `--max-turns` (checked when the next task arrives, the task stays unacked), `--max-wall` (also cuts a running turn) or token budgets inside a turn (the loop continues); 130 SIGINT/SIGTERM (the running turn ends `interrupted`, `loom.state exiting` follows); 2 bad flags, bus layout newer than known, session name held by another live session. `--max-turns` here counts user turns; the per-turn agent step cap is `--max-agent-turns`.
+
+Pinned by `cmd/loom/serve_test.go` and `pkg/filebus/filebus_test.go`.

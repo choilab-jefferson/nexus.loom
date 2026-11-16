@@ -93,6 +93,37 @@ For long ML runs that exceed the `run_command` timeout clamp. Jobs run allowlist
 loom -p "train with train.py, detached, then report the log tail" --allow-cmd "python train.py"
 ```
 
+## Loop mode
+
+`loom serve` keeps one loom alive and controls it through a directory instead of a terminal: the nexus **file bus** (spec: nexus.lite `docs/specs/file-bus.md`, sections 3-7 and 13). A host sends messages into `msg/<name>/`, loom answers into the host's inbox. There is no TTY, no stdin and no chat UI, and loom never opens SQLite; the bus client is Go stdlib only (`pkg/filebus`). One-shot `loom -p` / `loom run` are unchanged.
+
+```sh
+loom serve --bus-dir .nexus/bus --name loom-a1 --workspace . --provider anthropic \
+  --allow-cmd "go test" --max-turns 20 --max-wall 2h --idle-timeout 30m
+```
+
+| Flag | Meaning |
+|---|---|
+| `--bus-dir DIR`, `--name ID` | bus directory (or `NEXUS_BUS_DIR`) and the session name; hosts send to `msg/<ID>/` |
+| run flags | `--provider`, `--model`, `--workspace`, `--allow-cmd`, `--phi`, budgets and capability flags, as for `loom -p`; they apply to every user turn |
+| `--max-turns N` | user turns for the whole session (0 = unlimited). The per-turn agent step cap is `--max-agent-turns` (default 8) |
+| `--max-wall D`, `--idle-timeout D` | session wall-clock budget (exit 4); no message for D (exit 0) |
+| `--on-job-exit notify\|turn` | default `notify`: a job exit only emits a `job` message; `turn` also starts one synthetic user turn |
+| `--report-to NAME` | target for events outside a request (`started`, `job`, ...); default is the last requester |
+| `--poll-interval`, `--notify-tcp host:port` | poll fallback (default 1s, backs off while idle); optional loopback TCP wake-up endpoint |
+
+How it works: loom registers `sess/<ID>.json` (heartbeat every ttl/3), wakes on a Unix datagram (or the poll), and reads its inbox (cursor `_default`) **only at turn boundaries**. `loom.task` / `loom.prompt` runs one user turn on the persistent `loom.context.v1` (`state/<ID>.context.json`, kept across restarts) and answers with `loom.result` (status, exit code, usage, trace pointer). Control messages are handled and acked immediately:
+
+| Host -> loom | Effect |
+|---|---|
+| `loom.task` / `loom.prompt` | one user turn; `data.prompt` (or the body), `context_files`, `constraints` (budgets can only be lowered) |
+| `loom.inject` | append `messages` and workspace files (read under the usual path policy) to the context |
+| `loom.extract` | write `blob/<requester>/<id>.json` (`context` or `summary`) and reply `loom.extracted` with path and sha256 |
+| `loom.stop` | ack, emit `loom.state stopped`, exit 0; later messages stay unacked |
+| `loom.resume` | continue the interrupted or budget-stopped turn from its checkpoint |
+
+Loom -> host: `loom.result`, `loom.extracted`, `loom.state` (`started|idle|busy|stopped|exiting`) and the shared `job` kind for `.loom/jobs` jobs (`RUNNING` on start, `OK|FAIL|GONE|KILLED` on exit). A crash during a turn is reported on restart as `loom.result` `status: interrupted`, exit code 130; the turn is re-run only on `loom.resume`. Jobs started with `job_start` are killed when their turn ends unless `detach: true`. Exit codes: 0 stop or idle timeout, 4 budget, 130 signal, 2 config error. Details: [docs/contract.md](docs/contract.md#loop-mode-loom-serve-additive).
+
 ## Models
 
 Defaults: gemini `gemini-3.8-flash`, anthropic `claude-sonnet-5-5`, openai `gpt-4o-mini`, ollama `qwen3:4b` (`qwen3.5:4b-mlx` on macOS). Override with `--model` or `LOOM_MODEL`.
@@ -158,4 +189,4 @@ MIT, see [LICENSE](LICENSE).
 
 ## Hermetic tests
 
-Packages that can touch Nexus state carry a `hermetic_test.go` `TestMain` that points `HOME` and `NEXUS_CONFIG_HOME` at a temp dir and unsets `NEXUS_SENSITIVITY`, `LOOM_NO_AGENTS_MD`. Today that is five packages: `pkg/compact`, `pkg/engine`, `pkg/policy`, `pkg/providers`, `pkg/tools`. `cmd/loom` and `pkg/trace` have none because their tests touch no Nexus state; add one when a new package starts reading Nexus env or files.
+Packages that can touch Nexus state carry a `hermetic_test.go` `TestMain` that points `HOME` and `NEXUS_CONFIG_HOME` at a temp dir and unsets `NEXUS_SENSITIVITY`, `LOOM_NO_AGENTS_MD`. Today that is six packages: `pkg/compact`, `pkg/engine`, `pkg/filebus`, `pkg/policy`, `pkg/providers`, `pkg/tools`. `cmd/loom` and `pkg/trace` have none because their tests touch no Nexus state; add one when a new package starts reading Nexus env or files.

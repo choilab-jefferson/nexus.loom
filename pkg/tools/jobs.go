@@ -427,3 +427,44 @@ func KillAttachedJobs() {
 		}
 	}
 }
+
+// JobInfo is a read-only view of a .loom/jobs/<id>.json record for supervisors (loom loop mode).
+type JobInfo struct {
+	JobID    string
+	Status   string // "running", "exited" or "killed"
+	ExitCode *int   // nil when unknown (settled across invocations) or killed
+	Started  string
+	Ended    string
+}
+
+// ListJobs returns the workspace's job records in id order. A job marked running whose process is gone
+// is settled to exited with an unknown exit code, as job_status does. A missing jobs dir is not an error.
+func ListJobs(cfg *policy.PolicyConfig) ([]JobInfo, error) {
+	if _, err := os.Stat(filepath.Join(cfg.Workspace, jobsRelDir)); err != nil {
+		return nil, nil
+	}
+	dir, err := jobsDir(cfg)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var out []JobInfo
+	for _, e := range entries {
+		id := strings.TrimSuffix(e.Name(), ".json")
+		if id == e.Name() || !jobIDRe.MatchString(id) {
+			continue
+		}
+		m, err := loadJob(dir, id)
+		if err != nil {
+			continue
+		}
+		out = append(out, JobInfo{JobID: m.JobID, Status: m.Status, ExitCode: m.ExitCode, Started: m.Started, Ended: m.Ended})
+	}
+	return out, nil
+}
+
+// JobRecordPath returns the workspace-relative path of a job record.
+func JobRecordPath(id string) string { return jobsRelDir + "/" + id + ".json" }
